@@ -1318,6 +1318,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     timeout=timeout_seconds,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
+                    large_source_summary_min_source_tokens=(
+                        self._config.large_source_summary_min_source_tokens
+                    ),
+                    large_source_summary_min_result_tokens=(
+                        self._config.large_source_summary_min_result_tokens
+                    ),
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
                 )
@@ -4992,6 +4998,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             timeout=timeout_seconds,
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
+            large_source_summary_min_source_tokens=(
+                self._config.large_source_summary_min_source_tokens
+            ),
+            large_source_summary_min_result_tokens=(
+                self._config.large_source_summary_min_result_tokens
+            ),
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
         )
