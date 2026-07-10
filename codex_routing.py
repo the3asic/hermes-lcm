@@ -17,6 +17,7 @@ from __future__ import annotations
 # we still have to budget against the effective provider window or compaction
 # fires too late and provider requests can overflow.
 _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
+    "gpt-5.6": 372_000,
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex-spark": 128_000,
@@ -55,7 +56,17 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
     for slug, cap in sorted(
         _CODEX_OAUTH_CONTEXT_CAPS.items(), key=lambda item: len(item[0]), reverse=True
     ):
-        if slug in bare_model:
+        # Match a known model family, not an arbitrary substring. The old
+        # ``slug in bare_model`` rule made the generic ``gpt-5`` entry capture
+        # every future minor version, so gpt-5.6-sol was incorrectly capped at
+        # the legacy 272K Codex window. A hyphen denotes a variant/date suffix;
+        # dotted suffixes are accepted only for minor-version keys so the major
+        # ``gpt-5`` fallback cannot swallow gpt-5.6, gpt-5.7, and later models.
+        is_known_variant = bare_model.startswith(f"{slug}-")
+        is_minor_version_variant = (
+            slug.count(".") >= 1 and bare_model.startswith(f"{slug}.")
+        )
+        if bare_model == slug or is_known_variant or is_minor_version_variant:
             return cap
     return None
 
