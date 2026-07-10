@@ -448,6 +448,51 @@ def test_codex_oauth_context_cap_applies_without_gpt55_threshold_magic(tmp_path)
         engine.shutdown()
 
 
+def test_codex_gpt56_uses_current_372k_route_cap(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "codex-gpt56-cap.db"),
+    )
+    config.config_sources["context_threshold"] = "env:LCM_CONTEXT_THRESHOLD"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            context_length=1_050_000,
+        )
+
+        assert engine.raw_context_length == 1_050_000
+        assert engine.context_length == 372_000
+        assert engine.effective_context_length_cap == 372_000
+        assert engine.effective_context_length_reason == "codex_oauth_context_cap"
+        assert engine.threshold_tokens == int(372_000 * 0.85)
+    finally:
+        engine.shutdown()
+
+
+def test_unknown_future_codex_minor_does_not_inherit_legacy_gpt5_cap(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "codex-future-minor.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.7-sol",
+            provider="openai-codex",
+            context_length=480_000,
+        )
+
+        assert engine.raw_context_length == 480_000
+        assert engine.context_length == 480_000
+        assert engine.effective_context_length_cap is None
+        assert engine.effective_context_length_reason == ""
+        assert engine.threshold_tokens == int(480_000 * 0.85)
+    finally:
+        engine.shutdown()
+
+
 def test_codex_oauth_context_cap_constrains_reserve_based_assembly_cap(tmp_path):
     config = LCMConfig(
         context_threshold=0.85,
