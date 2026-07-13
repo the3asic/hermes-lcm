@@ -18,8 +18,12 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import json
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,9 +54,176 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_MAX_REPLAY_IDENTITY_CACHE_BYTES = 32 * 1024 * 1024
+_COMPACT_TOOL_REPLAY_IDENTITY_CHARS = 64 * 1024
+_COMPACT_TOOL_REPLAY_IDENTITY_PREFIX = "[LCM compact tool replay identity: "
 
 
 class ReconcileMixin:
+    def _replay_operation_local_state(self) -> threading.local:
+        local = getattr(self, "_replay_operation_local", None)
+        if local is None:
+            local = threading.local()
+            self._replay_operation_local = local
+        return local
+
+    @contextmanager
+    def _replay_identity_operation(self):
+        """Cache compact replay identities only for one reconciliation pass.
+
+        Nested reconciliation/store-map helpers share the same thread-local
+        operation. Large tool content is represented by a digest and the cache
+        has a byte cap; the outermost exit releases all entries.
+        """
+
+        local = self._replay_operation_local_state()
+        depth = int(getattr(local, "depth", 0) or 0)
+        if depth == 0:
+            local.identity_cache = {}
+            local.identity_cache_bytes = 0
+            local.recovery_availability_cache = {}
+        local.depth = depth + 1
+        try:
+            yield
+        finally:
+            local.depth -= 1
+            if local.depth == 0:
+                for name in (
+                    "identity_cache",
+                    "identity_cache_bytes",
+                    "recovery_availability_cache",
+                ):
+                    if hasattr(local, name):
+                        delattr(local, name)
+
+    def _replay_operation_cache(self, name: str) -> dict | None:
+        local = getattr(self, "_replay_operation_local", None)
+        if local is None or int(getattr(local, "depth", 0) or 0) <= 0:
+            return None
+        return getattr(local, name, None)
+
+    def _record_persisted_output_recovery_availability(
+        self,
+        msg: Dict[str, Any],
+        available: bool,
+    ) -> None:
+        cache = self._replay_operation_cache("recovery_availability_cache")
+        if cache is not None:
+            cache[id(msg)] = (msg, available)
+
+    def _recover_persisted_output_for_replay(
+        self,
+        content: str,
+        *,
+        msg: Dict[str, Any] | None = None,
+    ):
+        recovered = recover_hermes_persisted_output_with_file_stat(content)
+        if msg is not None:
+            self._record_persisted_output_recovery_availability(
+                msg,
+                recovered is not None,
+            )
+        return recovered
+
+    def _persisted_output_recovery_available(self, msg: Dict[str, Any]) -> bool:
+        cache = self._replay_operation_cache("recovery_availability_cache")
+        cached = cache.get(id(msg)) if cache is not None else None
+        if cached is not None and cached[0] is msg:
+            return bool(cached[1])
+        content = normalize_content_value(msg.get("content")) or ""
+        return self._recover_persisted_output_for_replay(content, msg=msg) is not None
+
+    def _find_durable_persisted_output_for_replay(
+        self,
+        *,
+        tool_call_id: str,
+        session_id: str,
+        expected_chars: int | None,
+        persisted_output_source_path: str | None,
+        persisted_output_preview_sha256: str | None,
+        require_persisted_output_file_not_newer: bool = False,
+        allow_redacted_preview_match: bool = True,
+        require_missing_file_generation_metadata: bool = False,
+        persisted_output_file_size: int | None = None,
+        persisted_output_file_mtime_ns: int | None = None,
+        persisted_output_file_ctime_ns: int | None = None,
+    ) -> str | None:
+        return find_externalized_tool_result_content_for_call(
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            expected_chars=expected_chars,
+            persisted_output_source_path=persisted_output_source_path,
+            persisted_output_preview_sha256=persisted_output_preview_sha256,
+            require_persisted_output_file_not_newer=(
+                require_persisted_output_file_not_newer
+            ),
+            allow_redacted_preview_match=allow_redacted_preview_match,
+            require_missing_file_generation_metadata=(
+                require_missing_file_generation_metadata
+            ),
+            persisted_output_file_size=persisted_output_file_size,
+            persisted_output_file_mtime_ns=persisted_output_file_mtime_ns,
+            persisted_output_file_ctime_ns=persisted_output_file_ctime_ns,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
+    def _load_externalized_payload_for_replay(self, ref: str):
+        return load_externalized_payload(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
+    def _externalized_payload_has_persisted_marker_for_replay(self, ref: str) -> bool:
+        return externalized_tool_result_has_persisted_output_marker(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
+    @staticmethod
+    def _compact_tool_replay_identity_content(role: str, content: str) -> str:
+        """Bound replay-identity memory without weakening exact tool matches."""
+
+        if role != "tool" or (
+            len(content) <= _COMPACT_TOOL_REPLAY_IDENTITY_CHARS
+            and not content.startswith(_COMPACT_TOOL_REPLAY_IDENTITY_PREFIX)
+        ):
+            return content
+        digest_builder = hashlib.sha256()
+        byte_count = 0
+        chunk_chars = 1024 * 1024
+        for start in range(0, len(content), chunk_chars):
+            encoded_chunk = content[start : start + chunk_chars].encode("utf-8")
+            digest_builder.update(encoded_chunk)
+            byte_count += len(encoded_chunk)
+        digest = digest_builder.hexdigest()
+        return _COMPACT_TOOL_REPLAY_IDENTITY_PREFIX + (
+            f"sha256={digest}; chars={len(content)}; bytes={byte_count}]"
+        )
+
+    def _cache_replay_identity(
+        self,
+        msg: Dict[str, Any],
+        cache_key: tuple[int, bool],
+        identity: tuple[str, str, str, str],
+    ) -> None:
+        cache = self._replay_operation_cache("identity_cache")
+        local = getattr(self, "_replay_operation_local", None)
+        if cache is None or local is None:
+            return
+        # A conservative character bound avoids making another full bytes copy
+        # just to decide whether a large identity can enter the cache.
+        estimated_bytes = sum(len(part) * 4 for part in identity)
+        cached_bytes = int(getattr(local, "identity_cache_bytes", 0) or 0)
+        if cached_bytes + estimated_bytes > _MAX_REPLAY_IDENTITY_CACHE_BYTES:
+            return
+        # Hold the source object so CPython cannot recycle id(msg) for a
+        # different temporary dict during this operation.
+        cache[cache_key] = (msg, identity)
+        local.identity_cache_bytes = cached_bytes + estimated_bytes
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -101,11 +272,11 @@ class ReconcileMixin:
             or not persisted_output_preview_sha256
         ):
             return False
-        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
+        recovered_with_stat = self._recover_persisted_output_for_replay(content, msg=msg)
         if recovered_with_stat is None:
             return False
         require_live_file_freshness = True
-        durable_content = find_externalized_tool_result_content_for_call(
+        durable_content = self._find_durable_persisted_output_for_replay(
             tool_call_id=str(msg.get("tool_call_id") or ""),
             session_id=str(msg.get("session_id") or self._session_id or ""),
             expected_chars=expected_chars,
@@ -113,8 +284,6 @@ class ReconcileMixin:
             persisted_output_preview_sha256=persisted_output_preview_sha256,
             require_persisted_output_file_not_newer=require_live_file_freshness,
             allow_redacted_preview_match=allow_redacted_preview_match,
-            config=self._config,
-            hermes_home=self._hermes_home,
         )
         if durable_content is None:
             return False
@@ -125,6 +294,12 @@ class ReconcileMixin:
         return True
 
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        identity_cache = self._replay_operation_cache("identity_cache")
+        identity_cache_key = (id(msg), stored_row)
+        if identity_cache is not None and identity_cache_key in identity_cache:
+            cached_msg, cached_identity = identity_cache[identity_cache_key]
+            if cached_msg is msg:
+                return cached_identity
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if (
@@ -136,7 +311,11 @@ class ReconcileMixin:
             persisted_output_source_path = _persisted_output_saved_path(content)
             persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
             durable_content = None
-            recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content) if not stored_row else None
+            recovered_with_stat = (
+                self._recover_persisted_output_for_replay(content, msg=msg)
+                if not stored_row
+                else None
+            )
             recovered_content = recovered_with_stat[0] if recovered_with_stat is not None else None
             recovered_identity_content = None
             if recovered_content is not None:
@@ -172,7 +351,7 @@ class ReconcileMixin:
                 and persisted_output_preview_sha256
                 and recovered_with_stat is not None
             ):
-                durable_content = find_externalized_tool_result_content_for_call(
+                durable_content = self._find_durable_persisted_output_for_replay(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
                     session_id=str(msg.get("session_id") or self._session_id or ""),
                     expected_chars=expected_chars,
@@ -180,23 +359,19 @@ class ReconcileMixin:
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
                     require_persisted_output_file_not_newer=require_live_file_freshness,
                     allow_redacted_preview_match=allow_redacted_preview_match,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
                 )
             if durable_content is not None and (
                 recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
             ):
                 content = durable_content
             elif recovered_content is not None:
-                stale_durable_content = find_externalized_tool_result_content_for_call(
+                stale_durable_content = self._find_durable_persisted_output_for_replay(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
                     session_id=str(msg.get("session_id") or self._session_id or ""),
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
                     allow_redacted_preview_match=allow_redacted_preview_match,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
                 )
                 if (
                     stale_durable_content is not None
@@ -227,20 +402,20 @@ class ReconcileMixin:
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
         ref = extract_externalized_ref(content)
         if ref and "quarantined_assistant_output" not in content:
-            payload = load_externalized_payload(
-                ref,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
+            payload = self._load_externalized_payload_for_replay(ref)
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
+        content = self._compact_tool_replay_identity_content(role, content)
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
-        return (
+        identity = (
             role,
             content,
             str(msg.get("tool_call_id") or ""),
             tool_calls_identity,
         )
+        if identity_cache is not None:
+            self._cache_replay_identity(msg, identity_cache_key, identity)
+        return identity
 
     @staticmethod
     def _matches_store_tail_suffix(
@@ -275,11 +450,7 @@ class ReconcileMixin:
         ref = extract_externalized_ref(content)
         if not ref:
             return False
-        return externalized_tool_result_has_persisted_output_marker(
-            ref,
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
+        return self._externalized_payload_has_persisted_marker_for_replay(ref)
 
     @staticmethod
     def _persisted_output_durable_wildcard_identity(
@@ -428,6 +599,26 @@ class ReconcileMixin:
         session_count: int,
         raw_session_count: int,
     ) -> int | None:
+        with self._replay_identity_operation():
+            return self._find_reconciled_cursor_for_store_tail_uncached(
+                messages,
+                stored_tail,
+                stored_tail_rows=stored_tail_rows,
+                allow_empty_prefix=allow_empty_prefix,
+                session_count=session_count,
+                raw_session_count=raw_session_count,
+            )
+
+    def _find_reconciled_cursor_for_store_tail_uncached(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_tail: list[tuple[str, str, str, str]],
+        *,
+        stored_tail_rows: list[Dict[str, Any]] | None = None,
+        allow_empty_prefix: bool,
+        session_count: int,
+        raw_session_count: int,
+    ) -> int | None:
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
         sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
@@ -509,10 +700,7 @@ class ReconcileMixin:
             early_candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and not self._persisted_output_recovery_available(msg)
                 for msg in candidate_identity_messages
             )
             if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
@@ -531,10 +719,7 @@ class ReconcileMixin:
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and not self._persisted_output_recovery_available(msg)
                 for msg in candidate_identity_messages
             )
             matches_inline_generation_cleanup_tail = False
@@ -788,6 +973,23 @@ class ReconcileMixin:
         return stored_head[: len(incoming_identities)] == incoming_identities
 
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+        started_at = time.perf_counter()
+        with self._replay_identity_operation():
+            cursor = self._reconcile_ingest_cursor_from_store_uncached(messages)
+        elapsed_seconds = time.perf_counter() - started_at
+        logger.info(
+            "LCM ingest cursor reconciliation finished: session=%s incoming=%d cursor=%d elapsed=%.3fs",
+            self._session_id,
+            len(messages),
+            cursor,
+            elapsed_seconds,
+        )
+        return cursor
+
+    def _reconcile_ingest_cursor_from_store_uncached(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
             return 0
@@ -886,10 +1088,7 @@ class ReconcileMixin:
         incoming_has_unproofed_raw_persisted_marker = any(
             str(msg.get("role") or "") == "tool"
             and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-            and recover_hermes_persisted_output_with_file_stat(
-                normalize_content_value(msg.get("content")) or ""
-            )
-            is None
+            and not self._persisted_output_recovery_available(msg)
             for msg in messages
         )
         if (
@@ -939,6 +1138,13 @@ class ReconcileMixin:
         )
 
     def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+        with self._replay_identity_operation():
+            return self._get_store_id_map_for_messages_uncached(messages)
+
+    def _get_store_id_map_for_messages_uncached(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated

@@ -760,11 +760,6 @@ class CompactionMixin:
                     recovery_assembly_cap,
                     count_messages_tokens(compressed),
                 )
-        # Reset cursor to the length of the compressed context so that
-        # only messages appended *after* this point get ingested next time.
-        self._ingest_cursor = len(compressed)
-        self._ingest_cursor_needs_reconcile = False
-
         logger.info(
             "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
             self.compression_count,
@@ -782,6 +777,11 @@ class CompactionMixin:
         # compress() output is consumed directly by the main loop in some
         # edge cases (e.g. forced overflow recovery bypassing _assemble_context).
         compressed = self._sanitize_active_context_messages(compressed)
+        # Rebase only after final sanitization. Older Hermes hosts do not pass
+        # active_message_count on the same-session boundary callback, so this
+        # value must describe the exact list returned to the host.
+        self._ingest_cursor = len(compressed)
+        self._ingest_cursor_needs_reconcile = False
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(compressed)
         )
