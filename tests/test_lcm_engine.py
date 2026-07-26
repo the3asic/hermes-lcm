@@ -311,6 +311,27 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["config"]["summary_timeout_ms"] == 60_000
 
 
+def test_compress_exception_sets_terminal_error_status_and_reraises_same_exception(
+    engine,
+    monkeypatch,
+):
+    original = RuntimeError("forced compaction failure")
+    engine._last_compression_status = "noop"
+    engine._last_compression_noop_reason = "stale no-op reason"
+
+    def fail_ingest(_messages):
+        raise original
+
+    monkeypatch.setattr(engine, "_ingest_messages", fail_ingest)
+    with pytest.raises(RuntimeError) as caught:
+        engine.compress([{"role": "user", "content": "trigger"}])
+
+    assert caught.value is original
+    assert engine.last_compression_status == "error"
+    assert engine.last_compression_noop_reason == ""
+    assert engine.last_compression_was_noop is False
+
+
 def test_update_model_updates_runtime_metadata_and_context_window(engine):
     engine.update_model(
         model="deepseek-v4-flash",
@@ -1061,7 +1082,7 @@ def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
 
     assert identity["engine"] == "lcm"
     assert identity["plugin_name"] == "hermes-lcm"
-    assert identity["plugin_version"] == "0.19.0"
+    assert identity["plugin_version"] == "0.20.0"
     assert Path(identity["plugin_path"]) == repo_root
     assert Path(identity["module_path"]).name == "engine.py"
     assert Path(identity["database_path"]) == db_path
@@ -1087,11 +1108,11 @@ def test_plugin_metadata_refreshes_when_manifest_changes(tmp_path, monkeypatch):
 
     initial = identity_mod._plugin_metadata()
     assert initial["name"] == "hermes-lcm"
-    assert initial["version"] == "0.19.0"
+    assert initial["version"] == "0.20.0"
 
-    updated = original.replace('version: "0.19.0"', 'version: "9.9.9-test"')
+    updated = original.replace('version: "0.20.0"', 'version: "9.9.9-test"')
     if updated == original:
-        updated = original.replace('version: 0.19.0', 'version: 9.9.9-test')
+        updated = original.replace('version: 0.20.0', 'version: 9.9.9-test')
     assert updated != original
 
     try:
@@ -1129,7 +1150,7 @@ def test_lcm_doctor_json_includes_runtime_identity(engine):
     payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
-    assert payload["runtime_identity"]["plugin_version"] == "0.19.0"
+    assert payload["runtime_identity"]["plugin_version"] == "0.20.0"
     assert "plugin_git_commit" in payload["runtime_identity"]
 
 
