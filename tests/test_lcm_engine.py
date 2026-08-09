@@ -464,6 +464,51 @@ def test_codex_oauth_context_cap_applies_without_gpt55_threshold_magic(tmp_path)
         engine.shutdown()
 
 
+def test_codex_gpt56_uses_current_372k_route_cap(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "codex-gpt56-cap.db"),
+    )
+    config.config_sources["context_threshold"] = "env:LCM_CONTEXT_THRESHOLD"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            context_length=1_050_000,
+        )
+
+        assert engine.raw_context_length == 1_050_000
+        assert engine.context_length == 372_000
+        assert engine.effective_context_length_cap == 372_000
+        assert engine.effective_context_length_reason == "codex_oauth_context_cap"
+        assert engine.threshold_tokens == int(372_000 * 0.85)
+    finally:
+        engine.shutdown()
+
+
+def test_unknown_future_codex_minor_does_not_inherit_legacy_gpt5_cap(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "codex-future-minor.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.7-sol",
+            provider="openai-codex",
+            context_length=480_000,
+        )
+
+        assert engine.raw_context_length == 480_000
+        assert engine.context_length == 480_000
+        assert engine.effective_context_length_cap is None
+        assert engine.effective_context_length_reason == ""
+        assert engine.threshold_tokens == int(480_000 * 0.85)
+    finally:
+        engine.shutdown()
+
+
 def test_codex_oauth_context_cap_constrains_reserve_based_assembly_cap(tmp_path):
     config = LCMConfig(
         context_threshold=0.85,
@@ -18793,6 +18838,176 @@ class TestSessionRollover:
         assert status["lifecycle"]["last_finalized_frontier_store_id"] == store_id
         assert status["lifecycle"]["last_rollover_at"] is not None
         assert status["lifecycle"]["last_reset_at"] is None
+
+    def test_same_session_in_place_boundary_preserves_cursor_and_only_ingests_suffix(self, engine):
+        messages = [
+            {"role": "user", "content": "before in-place compression"},
+            {"role": "assistant", "content": "reply before in-place compression"},
+        ]
+        engine.on_session_start(
+            "same-session",
+            platform="telegram",
+            conversation_id="same-conversation",
+            context_length=200000,
+        )
+        engine._ingest_messages(messages)
+        initial_count = engine._store.get_session_count("same-session")
+        engine.compression_count = 3
+        engine.last_prompt_tokens = 1234
+        engine._last_compacted_store_id = 17
+        engine._ingest_cursor = len(messages)
+        engine._ingest_cursor_needs_reconcile = False
+        engine._last_active_replay_source_identities = [("stale",)]
+        engine._last_active_replay_messages = [{"role": "user", "content": "stale"}]
+        compressed_active_messages = messages + [
+            {
+                "role": "user",
+                "content": "synthetic continuity appended after compressor return",
+            }
+        ]
+
+        engine.on_session_start(
+            "same-session",
+            boundary_reason="compression",
+            old_session_id="same-session",
+            in_place=True,
+            active_message_count=len(compressed_active_messages),
+            platform="telegram",
+            conversation_id="same-conversation",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "same-session"
+        assert engine._conversation_id == "same-conversation"
+        assert engine._ingest_cursor == len(compressed_active_messages)
+        assert engine._ingest_cursor_needs_reconcile is False
+        assert engine._last_compacted_store_id == 17
+        assert engine.compression_count == 3
+        assert engine.last_prompt_tokens == 1234
+        assert engine._last_active_replay_source_identities == []
+        assert engine._last_active_replay_messages == []
+        assert engine._last_ingest_reconciliation["reason"] == (
+            "same-session in-place compression boundary"
+        )
+
+        engine._ingest_messages(
+            compressed_active_messages
+            + [{"role": "user", "content": "new message after compression"}]
+        )
+        rows = engine._store.get_session_messages("same-session", limit=20)
+        assert engine._store.get_session_count("same-session") == initial_count + 1
+        assert [row["content"] for row in rows].count("before in-place compression") == 1
+        assert [row["content"] for row in rows].count("reply before in-place compression") == 1
+        assert all(
+            row["content"] != "synthetic continuity appended after compressor return"
+            for row in rows
+        )
+        assert [row["content"] for row in rows].count("new message after compression") == 1
+
+    def test_large_tool_replay_identity_is_compact_and_content_exact(self, engine):
+        content_a = "A" * 70_000
+        content_b = "A" * 69_999 + "B"
+
+        with engine._replay_identity_operation():
+            identity_a = engine._message_replay_identity(
+                {"role": "tool", "tool_call_id": "call-large", "content": content_a}
+            )
+            identity_a_again = engine._message_replay_identity(
+                {"role": "tool", "tool_call_id": "call-large", "content": content_a}
+            )
+            identity_b = engine._message_replay_identity(
+                {"role": "tool", "tool_call_id": "call-large", "content": content_b}
+            )
+            marker_alias = engine._message_replay_identity(
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-large",
+                    "content": identity_a[1],
+                }
+            )
+
+        assert identity_a == identity_a_again
+        assert identity_a != identity_b
+        assert identity_a != marker_alias
+        assert identity_a[1].startswith("[LCM compact tool replay identity: sha256=")
+        assert len(identity_a[1]) < 200
+        assert content_a[:1_000] not in identity_a[1]
+
+    def test_persisted_output_recovery_availability_reads_once_per_operation(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        import hermes_lcm.reconcile as reconcile
+
+        calls = 0
+
+        def fake_recover(_content):
+            nonlocal calls
+            calls += 1
+            return ("recovered content", object())
+
+        monkeypatch.setattr(
+            reconcile,
+            "recover_hermes_persisted_output_with_file_stat",
+            fake_recover,
+        )
+        msg = {"role": "tool", "tool_call_id": "call-recovery", "content": "marker"}
+
+        with engine._replay_identity_operation():
+            assert engine._persisted_output_recovery_available(msg) is True
+            assert engine._persisted_output_recovery_available(msg) is True
+            assert calls == 1
+
+        assert engine._persisted_output_recovery_available(msg) is True
+        assert calls == 2
+
+    def test_same_session_in_place_boundary_without_host_count_keeps_compressor_cursor(self, engine):
+        engine.on_session_start(
+            "same-session-legacy-host",
+            platform="telegram",
+            conversation_id="same-conversation-legacy-host",
+            context_length=200000,
+        )
+        engine._ingest_cursor = 7
+        engine._last_compacted_store_id = 11
+
+        engine.on_session_start(
+            "same-session-legacy-host",
+            boundary_reason="compression",
+            old_session_id="same-session-legacy-host",
+            platform="telegram",
+            conversation_id="same-conversation-legacy-host",
+            context_length=200000,
+        )
+
+        assert engine._ingest_cursor == 7
+        assert engine._last_compacted_store_id == 11
+        assert engine._ingest_cursor_needs_reconcile is False
+
+    def test_same_session_boundary_with_binding_conflict_uses_normal_rebind(self, engine):
+        engine.on_session_start(
+            "same-session-conflict",
+            platform="telegram",
+            conversation_id="conversation-a",
+            context_length=200000,
+        )
+        engine._ingest_cursor = 5
+        engine._last_compacted_store_id = 9
+
+        engine.on_session_start(
+            "same-session-conflict",
+            boundary_reason="compression",
+            old_session_id="same-session-conflict",
+            in_place=True,
+            active_message_count=3,
+            platform="discord",
+            conversation_id="conversation-b",
+            context_length=200000,
+        )
+
+        assert engine._ingest_cursor == 0
+        assert engine._last_compacted_store_id == 0
 
     def test_compression_boundary_uses_bound_lcm_source_when_host_old_session_differs(self, engine):
         engine.on_session_start("lcm-source", platform="telegram", context_length=200000)
