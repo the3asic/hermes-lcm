@@ -199,7 +199,7 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold", "custom_instructions"}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -249,6 +249,26 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
     except Exception:
         return default, "default"
     return default, "default"
+
+
+def _hermes_lcm_custom_instructions_with_source(default: str) -> tuple[str, str]:
+    """Read ``lcm.custom_instructions`` from Hermes config.yaml.
+
+    The environment variable remains a higher-priority operational override,
+    but normal long-lived prose belongs in Hermes's visible configuration
+    rather than in ``.env``.
+    """
+    cfg = _load_hermes_config_yaml()
+    try:
+        lcm_section = cfg.get("lcm") or {}
+        if not isinstance(lcm_section, dict):
+            return default, "default"
+        value = lcm_section.get("custom_instructions")
+        if value is None or not isinstance(value, str):
+            return default, "default"
+        return value, "config_yaml:lcm.custom_instructions"
+    except Exception:
+        return default, "default"
 
 
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
@@ -398,6 +418,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_max_tokens",
     "leaf_chunk_tokens",
     "context_threshold",
+    "custom_instructions",
     "summary_spend_max_calls",
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
@@ -719,6 +740,16 @@ class LCMConfig:
             default_source=context_source,
         )
         _record("context_threshold", source, warning)
+        custom_default, custom_source = _hermes_lcm_custom_instructions_with_source(
+            c.custom_instructions
+        )
+        raw_custom_instructions = os.environ.get("LCM_CUSTOM_INSTRUCTIONS")
+        if raw_custom_instructions is None:
+            c.custom_instructions = custom_default
+            _record("custom_instructions", custom_source)
+        else:
+            c.custom_instructions = raw_custom_instructions
+            _record("custom_instructions", "env:LCM_CUSTOM_INSTRUCTIONS")
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled
         )

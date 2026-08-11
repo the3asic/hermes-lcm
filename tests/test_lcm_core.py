@@ -845,6 +845,35 @@ class TestConfig:
 
         assert c.context_threshold == 0.68
 
+    def test_from_env_reads_custom_instructions_from_hermes_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  custom_instructions: Write clear notes.\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CUSTOM_INSTRUCTIONS", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.custom_instructions == "Write clear notes."
+        assert c.config_sources["custom_instructions"] == "config_yaml:lcm.custom_instructions"
+        assert "custom_instructions" not in c.ignored_config_yaml_lcm_keys
+
+    def test_custom_instructions_env_overrides_hermes_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  custom_instructions: Write clear notes.\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Temporary override.")
+
+        c = LCMConfig.from_env()
+
+        assert c.custom_instructions == "Temporary override."
+        assert c.config_sources["custom_instructions"] == "env:LCM_CUSTOM_INSTRUCTIONS"
+
     def test_from_env_reads_hermes_codex_gpt55_autoraise_flag(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
