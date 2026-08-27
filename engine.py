@@ -4,6 +4,7 @@ Implements the ContextEngine ABC. Replaces the built-in ContextCompressor
 with a DAG-based summarization system that preserves every message.
 """
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -13,8 +14,9 @@ import re
 import sqlite3
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
 
@@ -82,6 +84,10 @@ from .rollup_builder import (
     mark_stale_for_published_summary,
     run_rollup_maintenance,
 )
+from .assertion_extraction import ModelAssertionExtractor
+from .assertion_store import AssertionStore, SourceSnapshot
+from .adaptive_retrieval import AdaptiveRetrievalRegistry
+from .query_view_store import QueryViewStore
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -90,8 +96,13 @@ from .schemas import (
     LCM_GREP,
     LCM_INSPECT,
     LCM_LOAD_SESSION,
+    LCM_COMPUTE,
+    LCM_COMPILE_EVIDENCE,
+    LCM_EVIDENCE_PACK,
+    LCM_QUERY_STATE,
     LCM_RECALL,
     LCM_RECENT,
+    LCM_RETRIEVE,
     LCM_STATUS,
 )
 from .sanitize import (
@@ -131,6 +142,209 @@ from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
+
+_ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+
+class _RollupMaintenanceScheduler:
+    """Run deduplicated rollup jobs on one process-wide worker.
+
+    Session binding only enqueues work. The worker is shared by every engine so
+    rapid gateway binds cannot create one thread per session. A key that is
+    already queued is ignored; a key requested while active gets at most one
+    follow-up pass, which preserves eventual progress when new staleness arrives
+    during an in-flight build without allowing concurrent duplicate builds.
+    """
+
+    def __init__(self, max_pending_jobs: int = 64) -> None:
+        self._condition = threading.Condition()
+        self._max_pending_jobs = max(1, int(max_pending_jobs))
+        self._jobs: deque[
+            tuple[tuple[str, str], Callable[[], None]]
+        ] = deque()
+        self._queued_keys: set[tuple[str, str]] = set()
+        self._active_keys: set[tuple[str, str]] = set()
+        # One worker means at most one active key. Keep its requested rerun in
+        # a literal single slot so queue saturation cannot discard the
+        # documented active-pass follow-up guarantee or grow hidden state.
+        self._follow_up_key: tuple[str, str] | None = None
+        self._follow_up_job: Callable[[], None] | None = None
+        self._running_follow_up = False
+        self._exclusive_keys: set[tuple[str, str]] = set()
+        self._owned_keys: dict[object, set[tuple[str, str]]] = {}
+        self._key_owners: dict[tuple[str, str], set[object]] = {}
+        self._worker: threading.Thread | None = None
+
+    def _track_owner_locked(
+        self,
+        key: tuple[str, str],
+        owner: object | None,
+    ) -> None:
+        if owner is None:
+            return
+        self._owned_keys.setdefault(owner, set()).add(key)
+        self._key_owners.setdefault(key, set()).add(owner)
+
+    def _release_key_owners_if_idle_locked(self, key: tuple[str, str]) -> None:
+        if (
+            key in self._queued_keys
+            or key in self._active_keys
+            or key in self._exclusive_keys
+            or self._follow_up_key == key
+        ):
+            return
+        for owner in self._key_owners.pop(key, set()):
+            owned = self._owned_keys.get(owner)
+            if owned is None:
+                continue
+            owned.discard(key)
+            if not owned:
+                self._owned_keys.pop(owner, None)
+
+    def schedule(
+        self,
+        key: tuple[str, str],
+        job: Callable[[], None],
+        *,
+        owner: object | None = None,
+    ) -> bool:
+        with self._condition:
+            if key in self._exclusive_keys:
+                logger.info(
+                    "LCM temporal rollup maintenance deferred while an operator "
+                    "rebuild owns database=%s scope=%s",
+                    key[0],
+                    key[1],
+                )
+                return False
+            if key in self._queued_keys:
+                self._track_owner_locked(key, owner)
+                return True
+            if key in self._active_keys and not self._running_follow_up:
+                self._follow_up_key = key
+                self._follow_up_job = job
+                self._track_owner_locked(key, owner)
+                self._condition.notify_all()
+                return True
+            if len(self._jobs) >= self._max_pending_jobs:
+                logger.warning(
+                    "LCM temporal rollup maintenance queue is full; "
+                    "deferring database=%s scope=%s until a later bind",
+                    key[0],
+                    key[1],
+                )
+                return False
+            if self._worker is None or not self._worker.is_alive():
+                worker = threading.Thread(
+                    target=self._run,
+                    name="lcm-rollup-maintenance",
+                    daemon=True,
+                )
+                worker.start()
+                self._worker = worker
+            self._jobs.append((key, job))
+            self._queued_keys.add(key)
+            self._track_owner_locked(key, owner)
+            self._condition.notify_all()
+            return True
+
+    def try_acquire_exclusive(self, key: tuple[str, str]) -> bool:
+        """Reserve one idle key for a synchronous operator rebuild.
+
+        This is intentionally non-blocking: a manual rebuild must not race a
+        provider-backed maintenance pass, but it also must not wait behind one
+        on the gateway thread. The caller can ask the operator to retry once the
+        background pass completes.
+        """
+        with self._condition:
+            busy_keys = self._queued_keys | self._active_keys | self._exclusive_keys
+            if key in busy_keys or self._follow_up_key == key:
+                return False
+            if len(self._exclusive_keys) >= self._max_pending_jobs:
+                return False
+            self._exclusive_keys.add(key)
+            return True
+
+    def release_exclusive(self, key: tuple[str, str]) -> None:
+        with self._condition:
+            self._exclusive_keys.discard(key)
+            self._condition.notify_all()
+
+    def drain(
+        self,
+        keys: set[tuple[str, str]],
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait until none of ``keys`` is queued or active."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            while keys & (
+                self._queued_keys
+                | self._active_keys
+                | self._exclusive_keys
+                | ({self._follow_up_key} if self._follow_up_key else set())
+            ):
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def drain_owner(
+        self,
+        owner: object,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait until every outstanding key accepted for ``owner`` is idle."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            while self._owned_keys.get(owner):
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._jobs:
+                    self._condition.wait()
+                key, job = self._jobs.popleft()
+                self._queued_keys.discard(key)
+                self._active_keys.add(key)
+                self._running_follow_up = False
+            while True:
+                try:
+                    job()
+                except (Exception, asyncio.CancelledError):
+                    logger.warning(
+                        "LCM background temporal rollup maintenance failed for database=%s scope=%s",
+                        key[0],
+                        key[1],
+                        exc_info=True,
+                    )
+                with self._condition:
+                    if self._follow_up_key == key and self._follow_up_job is not None:
+                        job = self._follow_up_job
+                        self._follow_up_key = None
+                        self._follow_up_job = None
+                        self._running_follow_up = True
+                        self._condition.notify_all()
+                        continue
+                    self._active_keys.discard(key)
+                    self._running_follow_up = False
+                    self._release_key_owners_if_idle_locked(key)
+                    self._condition.notify_all()
+                    break
+
+
+_ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
@@ -198,6 +412,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._assertion_extraction_metrics_lock = threading.RLock()
+        self._assertion_extraction_idle = threading.Event()
+        self._assertion_extraction_idle.set()
+        self._assertion_extraction_batches_scheduled = 0
+        self._assertion_extraction_batches_skipped_busy = 0
+        self._assertion_extraction_sources_scheduled = 0
+        self._assertion_extraction_sources_completed = 0
+        self._assertion_extraction_sources_failed = 0
+        self._assertion_extraction_provider_calls = 0
+        self._assertion_extraction_input_tokens = 0
+        self._assertion_extraction_output_tokens = 0
+        self._assertion_extraction_last_duration_ms = 0.0
+        self._assertion_extraction_last_error = ""
+        self._assertion_extraction_last_model = ""
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
@@ -410,6 +638,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        # The scheduler associates this identity only with outstanding work, so
+        # diagnostic drains do not retain every historical session key forever.
+        self._rollup_maintenance_owner = object()
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -481,21 +712,63 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        self._store = MessageStore(
-            db_path,
-            ingest_protection_config=self._config,
-            hermes_home=hermes_home,
-        )
-        self._dag = SummaryDAG(db_path)
-        if self._config.temporal_rollups_enabled:
-            # Install the transaction-coupled summary mutation triggers before
-            # this engine can publish or delete a DAG node.
-            initialize_rollup_invalidation_outbox(self._dag)
-        self._lifecycle = LifecycleStateStore(db_path)
+        self._assertions = None
+        self._query_views = None
+        self._adaptive_retrieval = None
+        self._assertion_extractor = None
+        try:
+            self._store = MessageStore(
+                db_path,
+                ingest_protection_config=self._config,
+                hermes_home=hermes_home,
+            )
+            self._dag = SummaryDAG(db_path)
+            if self._config.temporal_rollups_enabled:
+                # Install the transaction-coupled summary mutation triggers before
+                # this engine can publish or delete a DAG node.
+                initialize_rollup_invalidation_outbox(self._dag)
+            self._lifecycle = LifecycleStateStore(db_path)
+            self._assertions = (
+                AssertionStore(db_path)
+                if bool(getattr(self._config, "assertions_enabled", False))
+                else None
+            )
+            self._query_views = (
+                QueryViewStore(db_path)
+                if bool(getattr(self._config, "query_views_enabled", False))
+                or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
+                else None
+            )
+            self._adaptive_retrieval = (
+                AdaptiveRetrievalRegistry(self._query_views)
+                if bool(
+                    getattr(self._config, "adaptive_retrieval_enabled", False)
+                )
+                else None
+            )
+            if (
+                self._assertions is not None
+                and bool(getattr(self._config, "assertion_extraction_enabled", False))
+            ):
+                self._assertion_extractor = ModelAssertionExtractor(
+                    self._assertions,
+                    model=self._assertion_extraction_model(),
+                    timeout_seconds=self._assertion_extraction_timeout(),
+                )
+        except Exception:
+            self._close_storage()
+            raise
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle"):
+        for attr in (
+            "_adaptive_retrieval",
+            "_store",
+            "_dag",
+            "_lifecycle",
+            "_assertions",
+            "_query_views",
+        ):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -504,8 +777,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
+    def _assertion_extraction_model(self) -> str:
+        return str(
+            getattr(self._config, "assertion_extraction_model", "")
+            or getattr(self._config, "extraction_model", "")
+            or getattr(self._config, "summary_model", "")
+            or ""
+        )
+
+    def _assertion_extraction_timeout(self) -> float:
+        value = float(
+            getattr(self._config, "assertion_extraction_timeout_seconds", 30.0)
+        )
+        return min(120.0, max(0.1, value))
+
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        if self._adaptive_retrieval is not None:
+            self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
         self._session_id = ""
         self._session_platform = ""
@@ -1382,6 +1671,76 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- ContextEngine optional methods ------------------------------------
 
+    def _rollup_maintenance_key(self, scope: str) -> tuple[str, str]:
+        raw_database_path = str(self._dag.db_path)
+        if raw_database_path == ":memory:":
+            database_identity = f":memory:{id(self._dag)}"
+        else:
+            database_identity = str(Path(raw_database_path).resolve())
+        return database_identity, str(scope)
+
+    def try_acquire_rollup_operator_lease(
+        self,
+        scope: str,
+    ) -> tuple[str, str] | None:
+        """Reserve this database/scope for a synchronous rollup rebuild."""
+        key = self._rollup_maintenance_key(scope)
+        if not _ROLLUP_MAINTENANCE_SCHEDULER.try_acquire_exclusive(key):
+            return None
+        return key
+
+    def release_rollup_operator_lease(self, key: tuple[str, str]) -> None:
+        _ROLLUP_MAINTENANCE_SCHEDULER.release_exclusive(key)
+
+    def _schedule_rollup_maintenance(self, scope: str) -> None:
+        """Enqueue one best-effort rollup pass using private SQLite helpers."""
+        try:
+            raw_database_path = str(self._dag.db_path)
+            if raw_database_path == ":memory:":
+                logger.warning(
+                    "LCM cannot run background temporal rollup maintenance for "
+                    "an isolated in-memory SQLite database; maintenance skipped"
+                )
+                return
+            database_path = Path(raw_database_path).resolve()
+            key = self._rollup_maintenance_key(scope)
+            config = copy.deepcopy(self._config)
+            circuit_breaker = self._summary_circuit_breaker
+            spend_guard = self._summary_spend_guard
+
+            def maintain() -> None:
+                private_dag = SummaryDAG(database_path)
+                try:
+                    run_rollup_maintenance(
+                        private_dag,
+                        config,
+                        scope,
+                        circuit_breaker=circuit_breaker,
+                        spend_guard=spend_guard,
+                    )
+                finally:
+                    private_dag.close()
+
+            _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
+                key,
+                maintain,
+                owner=self._rollup_maintenance_owner,
+            )
+        except Exception:
+            # Maintenance is opportunistic; a scheduler/setup failure must never
+            # turn a successful foreground session bind into a host failure.
+            logger.warning(
+                "LCM could not schedule background temporal rollup maintenance",
+                exc_info=True,
+            )
+
+    def drain_rollup_maintenance(self, timeout: float | None = None) -> bool:
+        """Wait for rollup jobs scheduled by this engine (tests and diagnostics)."""
+        return _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(
+            self._rollup_maintenance_owner,
+            timeout=timeout,
+        )
+
     def _bind_lifecycle_state(
         self,
         session_id: str,
@@ -1433,11 +1792,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and not self._session_ignored
             and not self._session_stateless
         ):
-            run_rollup_maintenance(
-                self._dag, self._config, session_id,
-                circuit_breaker=self._summary_circuit_breaker,
-                spend_guard=self._summary_spend_guard,
-            )
+            self._schedule_rollup_maintenance(session_id)
 
     def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
         """Stale the rollups covering EVERY UTC day a just-published node spans.
@@ -3400,6 +3755,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return [
             LCM_GREP,
             LCM_RECALL,
+            LCM_QUERY_STATE,
+            LCM_COMPUTE,
+            LCM_COMPILE_EVIDENCE,
+            LCM_EVIDENCE_PACK,
+            LCM_RETRIEVE,
             LCM_RECENT,
             LCM_LOAD_SESSION,
             LCM_DESCRIBE,
@@ -3430,6 +3790,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
             "lcm_recall": lcm_tools.lcm_recall,
+            "lcm_query_state": lcm_tools.lcm_query_state,
+            "lcm_compute": lcm_tools.lcm_compute,
+            "lcm_compile_evidence": lcm_tools.lcm_compile_evidence,
+            "lcm_evidence_pack": lcm_tools.lcm_evidence_pack,
+            "lcm_retrieve": lcm_tools.lcm_retrieve,
             "lcm_recent": lcm_tools.lcm_recent,
             "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
@@ -3539,6 +3904,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
         })
+        with self._assertion_extraction_metrics_lock:
+            status["assertion_extraction"] = {
+                "store_enabled": self._assertions is not None,
+                "enabled": bool(
+                    getattr(self._config, "assertion_extraction_enabled", False)
+                ),
+                "model": self._assertion_extraction_model(),
+                "extractor": (
+                    getattr(self._assertion_extractor, "kind", "")
+                    if self._assertion_extractor is not None
+                    else ""
+                ),
+                "busy": not self._assertion_extraction_idle.is_set(),
+                "batches_scheduled": self._assertion_extraction_batches_scheduled,
+                "batches_skipped_busy": self._assertion_extraction_batches_skipped_busy,
+                "sources_scheduled": self._assertion_extraction_sources_scheduled,
+                "sources_completed": self._assertion_extraction_sources_completed,
+                "sources_failed": self._assertion_extraction_sources_failed,
+                "provider_calls": self._assertion_extraction_provider_calls,
+                "input_tokens": self._assertion_extraction_input_tokens,
+                "output_tokens": self._assertion_extraction_output_tokens,
+                "last_duration_ms": round(
+                    self._assertion_extraction_last_duration_ms, 3
+                ),
+                "last_error": self._assertion_extraction_last_error,
+                "last_model": self._assertion_extraction_last_model,
+            }
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
         lifecycle_state = self._lifecycle.get_by_conversation(conversation_id) if conversation_id else None
@@ -4536,6 +4928,146 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         except Exception as e:
             logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
+
+    def _run_assertion_extraction_batch(
+        self,
+        db_path: str,
+        snapshots: tuple[SourceSnapshot, ...],
+        model: str,
+        timeout_seconds: float,
+    ) -> None:
+        """Derive one bounded batch on a daemon worker outside raw writes."""
+        started = time.perf_counter()
+        completed = 0
+        failed = 0
+        last_error = ""
+        extractor = None
+        writer = None
+        try:
+            writer = AssertionStore(db_path)
+            extractor = ModelAssertionExtractor(
+                writer,
+                model=model,
+                timeout_seconds=timeout_seconds,
+            )
+            for snapshot in snapshots:
+                try:
+                    if writer.has_current_receipt(snapshot):
+                        completed += 1
+                        continue
+                    extraction = extractor(snapshot)
+                    writer.publish_source(
+                        snapshot,
+                        extraction.assertions,
+                        relations=extraction.relations,
+                    )
+                    completed += 1
+                except Exception as exc:
+                    failed += 1
+                    last_error = f"{type(exc).__name__}: {exc}"[:300]
+                    logger.warning(
+                        "Structured assertion extraction failed for store_id %s: %s",
+                        snapshot.store_id,
+                        last_error,
+                    )
+        except Exception as exc:
+            failed += max(1, len(snapshots) - completed)
+            last_error = f"{type(exc).__name__}: {exc}"[:300]
+            logger.warning("Structured assertion batch failed: %s", last_error)
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    logger.warning(
+                        "Structured assertion writer close failed",
+                        exc_info=True,
+                    )
+            duration_ms = (time.perf_counter() - started) * 1000
+            with self._assertion_extraction_metrics_lock:
+                self._assertion_extraction_sources_completed += completed
+                self._assertion_extraction_sources_failed += failed
+                self._assertion_extraction_last_duration_ms = duration_ms
+                self._assertion_extraction_last_error = last_error
+                self._assertion_extraction_last_model = model
+                if extractor is not None:
+                    self._assertion_extraction_provider_calls += extractor.call_count
+                    self._assertion_extraction_input_tokens += extractor.total_input_tokens
+                    self._assertion_extraction_output_tokens += extractor.total_output_tokens
+            self._assertion_extraction_idle.set()
+            _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
+
+    def _schedule_pre_compaction_assertions(
+        self, messages: List[Dict[str, Any]]
+    ) -> bool:
+        """Queue exact persisted rows without blocking the compaction path."""
+        if (
+            not bool(getattr(self._config, "assertion_extraction_enabled", False))
+            or self._assertions is None
+            or not messages
+        ):
+            return False
+        max_sources = min(
+            8,
+            max(
+                1,
+                int(
+                    getattr(
+                        self._config,
+                        "assertion_extraction_max_sources_per_pass",
+                        4,
+                    )
+                ),
+            ),
+        )
+        store_ids = sorted(dict.fromkeys(self._get_store_ids_for_messages(messages)))
+        snapshots: list[SourceSnapshot] = []
+        for store_id in store_ids:
+            try:
+                snapshot = self._assertions.snapshot_source(store_id)
+                if snapshot.role not in {"user", "assistant"}:
+                    continue
+                if not self._assertions.has_current_receipt(snapshot):
+                    snapshots.append(snapshot)
+            except (KeyError, sqlite3.Error):
+                continue
+            if len(snapshots) >= max_sources:
+                break
+        if not snapshots:
+            return False
+        if not _ASSERTION_EXTRACTION_PROCESS_SLOT.acquire(blocking=False):
+            with self._assertion_extraction_metrics_lock:
+                self._assertion_extraction_batches_skipped_busy += 1
+            return False
+
+        model = self._assertion_extraction_model()
+        timeout_seconds = self._assertion_extraction_timeout()
+        with self._assertion_extraction_metrics_lock:
+            self._assertion_extraction_batches_scheduled += 1
+            self._assertion_extraction_sources_scheduled += len(snapshots)
+        self._assertion_extraction_idle.clear()
+        worker = threading.Thread(
+            target=self._run_assertion_extraction_batch,
+            args=(str(self._store.db_path), tuple(snapshots), model, timeout_seconds),
+            name="lcm-assertion-extraction",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"[:300]
+            with self._assertion_extraction_metrics_lock:
+                self._assertion_extraction_sources_failed += len(snapshots)
+                self._assertion_extraction_last_error = last_error
+                self._assertion_extraction_last_model = model
+            self._assertion_extraction_idle.set()
+            _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
+            logger.warning(
+                "Structured assertion worker could not start: %s",
+                last_error,
+            )
+            return False
+        return True
 
     def _maybe_gc_compacted_tool_results(
         self,
@@ -6143,6 +6675,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        if self._adaptive_retrieval is not None:
+            self._adaptive_retrieval.close()
         self._store.close()
         self._dag.close()
         self._lifecycle.close()
+        if self._assertions is not None:
+            self._assertions.close()
+        if self._query_views is not None:
+            self._query_views.close()
