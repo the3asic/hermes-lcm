@@ -1745,6 +1745,78 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_smaller_cached_replay_cannot_hide_original_threshold_pressure(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_cached_replay_pressure.db"),
+            context_threshold=0.5,
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "test-session",
+            platform="api_server",
+            context_length=400,
+        )
+
+        def messages_with_arguments(arguments: str):
+            return [
+                {"role": "user", "content": "old backlog that is eligible"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-pressure",
+                            "type": "function",
+                            "function": {"name": "probe", "arguments": arguments},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-pressure",
+                    "content": "small result",
+                },
+                {"role": "user", "content": "fresh request"},
+            ]
+
+        compact_messages = messages_with_arguments('{"a":1}')
+        expanded_messages = messages_with_arguments('{"a":' + " \n" * 1_000 + "1}")
+        try:
+            assert instance.threshold_tokens == 200
+            assert count_messages_tokens(compact_messages) < instance.threshold_tokens
+            assert count_messages_tokens(expanded_messages) >= instance.threshold_tokens
+            assert instance._message_replay_identity(compact_messages[1]) == (
+                instance._message_replay_identity(expanded_messages[1])
+            )
+            assert instance.should_compress_preflight(compact_messages) is False
+
+            observed: dict[str, object] = {}
+            ingest = instance._ingest_messages
+
+            def capture_ingest(messages):
+                replay = ingest(messages)
+                observed["original"] = messages
+                observed["replay"] = replay
+                return replay
+
+            monkeypatch.setattr(instance, "_ingest_messages", capture_ingest)
+
+            assert instance.should_compress_preflight(expanded_messages) is True
+            assert observed["replay"] != observed["original"]
+            assert count_messages_tokens(observed["replay"]) < instance.threshold_tokens
+            assert instance._replay_diff_requests_ingest_cleanup(
+                observed["original"],
+                observed["replay"],
+            ) is False
+        finally:
+            instance.shutdown()
+
     def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),

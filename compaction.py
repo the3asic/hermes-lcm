@@ -117,6 +117,12 @@ class CompactionMixin:
                 return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
+            # If ingest restores a smaller cached canonical replay, the host
+            # still retains the larger original list unless compression is
+            # requested. Use both views for pressure so semantic normalization
+            # (for example whitespace-heavy JSON tool arguments) cannot hide a
+            # prompt that has already crossed the configured threshold.
+            pressure_rough = max(rough, replay_rough)
             cleanup_requested = self._replay_diff_requests_ingest_cleanup(
                 messages,
                 replay_messages,
@@ -149,7 +155,7 @@ class CompactionMixin:
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
-            if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+            if self.threshold_tokens > 0 and pressure_rough >= self.threshold_tokens:
                 # A replay can differ only because the host added provider
                 # metadata after the previous turn and ingest restored the
                 # cached canonical prefix. Equality alone is not context
@@ -165,14 +171,23 @@ class CompactionMixin:
                     return self._mark_preflight_compression_requested()
                 if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
                     return self._mark_preflight_compression_requested()
-                if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
+                if self._should_run_deferred_maintenance(
+                    replay_messages,
+                    observed_tokens=pressure_rough,
+                ):
                     return self._mark_preflight_compression_requested()
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
                 return False
-            self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
-            if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
+            self._refresh_raw_backlog_debt(
+                replay_messages,
+                observed_tokens=pressure_rough,
+            )
+            if self._should_run_deferred_maintenance(
+                replay_messages,
+                observed_tokens=pressure_rough,
+            ):
                 return self._mark_preflight_compression_requested()
             return False
         if self._compression_boundary_cooldown_active():
