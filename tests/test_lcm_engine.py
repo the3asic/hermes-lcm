@@ -1678,6 +1678,73 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_provider_metadata_replay_diff_does_not_bypass_500k_threshold(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_metadata_replay_diff.db"),
+            context_threshold=0.5,
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "test-session",
+            platform="api_server",
+            context_length=1_000_000,
+        )
+        first_turn = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"historical turn {index} " + "replay backlog segment " * 40,
+            }
+            for index in range(12)
+        ]
+        try:
+            assert instance.threshold_tokens == 500_000
+            assert count_messages_tokens(first_turn) < instance.threshold_tokens
+            assert instance._leaf_compaction_candidate_status(first_turn)[0] is True
+            assert instance.should_compress_preflight(first_turn) is False
+
+            second_turn = [dict(message) for message in first_turn]
+            # Hermes attaches provider transport metadata after the response.
+            # The semantic replay identity is unchanged, so LCM restores its
+            # cached prefix and the two dictionaries compare unequal.
+            second_turn[1]["reasoning"] = "provider reasoning envelope"
+            second_turn[1]["codex_reasoning_items"] = [
+                {"type": "reasoning", "text": "opaque transport metadata"}
+            ]
+            second_turn.extend(
+                [
+                    {"role": "assistant", "content": "first turn answer"},
+                    {"role": "user", "content": "next turn request"},
+                ]
+            )
+            observed: dict[str, object] = {}
+            ingest = instance._ingest_messages
+
+            def capture_ingest(messages):
+                replay = ingest(messages)
+                observed["original"] = messages
+                observed["replay"] = replay
+                return replay
+
+            monkeypatch.setattr(instance, "_ingest_messages", capture_ingest)
+
+            assert count_messages_tokens(second_turn) < instance.threshold_tokens
+            assert instance._leaf_compaction_candidate_status(second_turn)[0] is True
+            assert instance.should_compress_preflight(second_turn) is False
+            assert observed["replay"] != observed["original"]
+            assert instance._replay_diff_requests_ingest_cleanup(
+                observed["original"],
+                observed["replay"],
+            ) is False
+            assert instance._dag.get_session_node_count("test-session") == 0
+        finally:
+            instance.shutdown()
+
     def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),

@@ -149,19 +149,22 @@ class CompactionMixin:
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
-            eligible, reason = self._leaf_compaction_candidate_status(
-                replay_messages,
-                allow_partial_leaf=bool(
-                    self._config.threshold_full_sweep_enabled
-                    and self.threshold_tokens > 0
-                    and replay_rough >= self.threshold_tokens
-                ),
-            )
-            if eligible:
-                return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
-                return self._mark_preflight_compression_requested()
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+                # A replay can differ only because the host added provider
+                # metadata after the previous turn and ingest restored the
+                # cached canonical prefix. Equality alone is not context
+                # pressure: ordinary leaf/ignored-backlog work must remain
+                # behind the configured threshold just like the non-divergent
+                # path below. Explicit cleanup, overflow, and opt-in deferred
+                # maintenance keep their separate gates.
+                eligible, reason = self._leaf_compaction_candidate_status(
+                    replay_messages,
+                    allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+                )
+                if eligible:
+                    return self._mark_preflight_compression_requested()
+                if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
+                    return self._mark_preflight_compression_requested()
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
                     return self._mark_preflight_compression_requested()
                 self._last_compression_status = "noop"
