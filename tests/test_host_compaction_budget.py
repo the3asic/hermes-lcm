@@ -25,6 +25,9 @@ class _CompactionHost:
             return messages
         self.attempts += 1
         compressed = self.engine.compress(messages)
+        # The host waits for one response after committing a changed transcript.
+        if compressed != messages:
+            self.engine.awaiting_real_usage_after_compression = True
         # The real host sets this only after the transcript commit succeeds.
         if getattr(self.engine, "_last_compression_made_progress", False):
             self.engine._verify_compaction_cleared_threshold = True
@@ -134,6 +137,8 @@ def test_auxiliary_usage_does_not_consume_main_verification(host, monkeypatch):
         patch.setattr(host.engine, "_thread_context_session_id", lambda: "")
         host.engine.update_from_response({"prompt_tokens": 100})
 
+    assert host.engine.awaiting_real_usage_after_compression
+
     host.receive_usage(100)
     assert host.attempts == 0
 
@@ -147,3 +152,14 @@ def test_session_reset_discards_pending_verification(host):
     host.receive_usage(100)
     assert host.attempts == 1
     assert not host.engine._last_compression_made_progress
+    assert not host.engine.awaiting_real_usage_after_compression
+
+
+@pytest.mark.parametrize("usage", [{}, {"prompt_tokens": 0}, {"prompt_tokens": 100}, {"prompt_tokens": 6000}])
+def test_foreground_response_consumes_wait_even_without_usage(host, usage):
+    host.engine.awaiting_real_usage_after_compression = True
+    host.engine.update_from_response(usage)
+
+    assert not host.engine.awaiting_real_usage_after_compression
+    # New over-threshold content must be eligible for the host's post-tool gate.
+    assert host.engine.should_compress(host.engine.threshold_tokens + 1)

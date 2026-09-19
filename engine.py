@@ -585,6 +585,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_compression_noop_reason = ""
         self._last_compression_made_progress = False
         self._verify_compaction_cleared_threshold = False
+        self.awaiting_real_usage_after_compression = False
         # Ingest-failure tracking. The core promise is that nothing is ever
         # lost, but a swallowed persistence error (disk full, DB locked,
         # corruption) silently breaks it: the turn continues while messages
@@ -1197,6 +1198,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Hermes reads this flag before this call to verify a committed change.
         # Consume it once, including when this response has no token count.
         self._verify_compaction_cleared_threshold = False
+        # The host's post-tool gate must not keep waiting after this response.
+        # Auxiliary usage above belongs to another request and cannot clear it.
+        self.awaiting_real_usage_after_compression = False
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
