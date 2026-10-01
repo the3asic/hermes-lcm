@@ -1,6 +1,7 @@
 """Foreground summaries must publish against unchanged durable sources."""
 
 import copy
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -58,6 +59,15 @@ def _publication_state(engine):
 @pytest.mark.parametrize("mutation", ["content", "tool_calls", "delete", "frontier", "session", "parent"])
 def test_compress_rejects_sources_changed_during_model(engine, monkeypatch, mutation):
     messages = _messages()
+    if mutation == "tool_calls":
+        messages[1]["tool_calls"] = [{
+            "id": "synthetic-lookup", "type": "function",
+            "function": {"name": "lookup_fact", "arguments": '{"version":"original"}'},
+        }]
+        messages.insert(2, {
+            "role": "tool", "tool_call_id": "synthetic-lookup",
+            "content": "The original lookup result.",
+        })
     original = copy.deepcopy(messages)
     selected_ids = []
 
@@ -69,7 +79,9 @@ def test_compress_rejects_sources_changed_during_model(engine, monkeypatch, muta
             elif mutation == "content":
                 writer.execute("UPDATE messages SET content='changed source' WHERE store_id=?", (selected_ids[0],))
             elif mutation == "tool_calls":
-                writer.execute("UPDATE messages SET tool_calls='[]' WHERE store_id=?", (selected_ids[0],))
+                changed_calls = copy.deepcopy(messages[1]["tool_calls"])
+                changed_calls[0]["function"]["arguments"] = '{"version":"changed"}'
+                writer.execute("UPDATE messages SET tool_calls=? WHERE store_id=?", (json.dumps(changed_calls), selected_ids[1]))
             elif mutation == "frontier":
                 writer.execute("UPDATE lcm_lifecycle_state SET current_frontier_store_id=99 WHERE conversation_id='foreground-lane'")
             elif mutation == "session":
@@ -92,7 +104,7 @@ def test_compress_rejects_sources_changed_during_model(engine, monkeypatch, muta
     assert state.current_frontier_store_id == (99 if mutation == "frontier" else 0)
     assert messages == original
     rows = engine._store.get_session_messages("foreground-session")
-    assert len(rows) == (3 if mutation == "delete" else 4)
+    assert len(rows) == len(original) - (1 if mutation == "delete" else 0)
     assert rows[-2]["content"] == original[-2]["content"]
     assert rows[-1]["content"] == original[-1]["content"]
 
