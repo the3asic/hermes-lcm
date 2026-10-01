@@ -6044,16 +6044,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ),
             -1,
         )
-        reserve = count_message_tokens(live_user) if live_user is not None else 0
+        # A sole irreducible request remains visible and reports overflow. In
+        # other cases the established objective scaffold owns omitted users:
+        # replaying a non-contiguous raw user would duplicate it after restart.
+        if len(units) == 1 and units[0][0] is live_user:
+            self._assembly_protected_group_dropped = False
+            return units[0]
         selected = []
-        used = reserve
+        used = 0
         skipped = False
         self._assembly_protected_group_dropped = False
         for index in range(len(units) - 1, -1, -1):
             unit = units[index]
-            if live_user is not None and unit[0] is live_user:
-                selected.append((index, unit))
-                continue
             cost = sum(count_message_tokens(message) for message in unit)
             if used + cost > budget:
                 if unit[0].get("role") == "assistant" and unit[0].get("tool_calls"):
@@ -6064,13 +6066,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     continue
                 break
             if skipped:
-                # Preserve the live user below, but do not bridge a deleted
-                # exchange with older assistant traces.
-                continue
+                # Let the existing objective scaffold preserve omitted intent;
+                # never replay raw rows across a deleted exchange.
+                break
             selected.append((index, unit))
             used += cost
-        if live_user is not None and not any(unit[0] is live_user for _, unit in selected):
-            selected.append((next(i for i, unit in enumerate(units) if unit[0] is live_user), [live_user]))
         return [message for _, unit in sorted(selected) for message in unit]
 
     def _assemble_context(

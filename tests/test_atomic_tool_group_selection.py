@@ -1,4 +1,4 @@
-"""Budget selection retains complete concrete tool exchanges and live user."""
+"""Budget selection keeps complete exchanges and upstream replay protection."""
 import copy
 import pytest
 from hermes_lcm.config import LCMConfig
@@ -32,7 +32,8 @@ def test_budget_cannot_keep_half_exchange_or_replace_real_result_with_stub(engin
     original = copy.deepcopy(tail)
     cap = count_messages_tokens([user] + exchange[1:])
     result = engine._assemble_context(None, tail, assembly_cap_override=cap)
-    assert result == [user]
+    assert len(result) == 1
+    assert result[0]["content"] == engine._build_preserved_objective_summary_part(user)
     assert tail == original
 
 
@@ -75,9 +76,11 @@ def test_irreducible_user_is_retained_with_visible_overflow_failure(engine):
 
 def test_dropped_protected_exchange_is_not_reported_as_success(engine):
     tail = [{"role": "user", "content": "request"}] + group("new")
-    result = engine._assemble_context(None, tail, assembly_cap_override=20)
-    assert result == tail[:1]
-    engine._finalize_forced_overflow_result(tail, result, assembly_cap_override=20)
+    cap = count_messages_tokens([{"role": "user", "content": engine._build_preserved_objective_summary_part(tail[0])}])
+    result = engine._assemble_context(None, tail, assembly_cap_override=cap)
+    assert len(result) == 1
+    assert result[0]["content"] == engine._build_preserved_objective_summary_part(tail[0])
+    engine._finalize_forced_overflow_result(tail, result, assembly_cap_override=cap)
     assert engine._last_overflow_recovery_failed
 
 
@@ -99,10 +102,11 @@ def test_userless_and_media_tool_groups_remain_atomic(engine):
 def test_live_user_survives_an_over_budget_group_before_generated_todo(engine):
     user = {"role": "user", "content": "Compare my files."}
     todo = {"role": "user", "content": "[Your active task list was preserved across context compression]\nsynthetic task"}
-    cap = count_messages_tokens([user, todo])
+    objective = engine._build_preserved_objective_summary_part(user)
+    cap = count_messages_tokens([{"role": "user", "content": objective}, todo])
     tail = [user] + group("new") + [todo]
     result = engine._assemble_context(None, tail, assembly_cap_override=cap)
-    assert user in result
+    assert any(objective in message.get("content", "") for message in result)
     assert not any(message["role"] == "tool" for message in result)
     engine._finalize_forced_overflow_result(tail, result, assembly_cap_override=cap)
     assert engine.get_status()["overflow_recovery_failed"]
