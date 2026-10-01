@@ -261,6 +261,48 @@ class LifecycleStateStore:
         return state
 
     @_synchronized
+    def resume_compression_session(
+        self,
+        conversation_id: str,
+        session_id: str,
+        frontier_store_id: int = 0,
+    ) -> LifecycleState:
+        """Reopen only the same session finalized before an in-place boundary.
+
+        A stale callback must not steal a replacement session's ownership.
+        Serialize the ownership check with the write across SQLite connections;
+        ordinary bind_session intentionally has broader session-switch semantics.
+        """
+        conn = self._conn
+        if conn is None or conn.in_transaction:
+            raise RuntimeError("compression resume requires an idle lifecycle writer")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            state = self.get_by_conversation(conversation_id)
+            if state is None:
+                raise RuntimeError("compression boundary lost conversation ownership")
+            if state.current_session_id == session_id:
+                conn.commit()
+                return state
+            if state.current_session_id is not None or state.last_finalized_session_id != session_id:
+                raise RuntimeError("compression boundary lost conversation ownership")
+            # Use the continuing runtime's exact frontier. The finalized maximum
+            # may contain an older session's checkpoint and is not this frontier.
+            conn.execute(
+                """UPDATE lcm_lifecycle_state
+                   SET current_session_id = ?, current_frontier_store_id = ?, updated_at = ?
+                   WHERE conversation_id = ?""",
+                (session_id, max(0, int(frontier_store_id)), time.time(), conversation_id),
+            )
+            resumed = self.get_by_conversation(conversation_id)
+            assert resumed is not None
+            conn.commit()
+            return resumed
+        except BaseException:
+            conn.rollback()
+            raise
+
+    @_synchronized
     def finalize_session(
         self,
         conversation_id: str | None,

@@ -2808,6 +2808,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         )
         if same_binding_in_place_boundary:
+            # Older hosts end the session before announcing successful in-place
+            # compaction. Restore only that exact finalized owner, without the
+            # ordinary bind/reset path that would replay the active prefix.
+            self._lifecycle.resume_compression_session(
+                self._conversation_id, session_id, self._last_compacted_store_id,
+            )
             # Hermes performs in-place compression by calling compress() and
             # then emitting a compression boundary with the same session id.
             # compress() has already rebased the cursor to its returned active
