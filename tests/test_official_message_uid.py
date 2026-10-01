@@ -243,6 +243,69 @@ def test_rejected_compaction_old_history_and_new_uid_are_preserved(profile):
         close(instance)
 
 
+@pytest.mark.parametrize("restart", [False, True], ids=["warm", "cold"])
+def test_actual_compress_rejected_by_host_preserves_original_and_new_core_uids(profile, monkeypatch, restart):
+    core = pytest.importorskip("hermes_state")
+    from hermes_lcm import engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module, "summarize_with_escalation",
+        lambda **_kwargs: ("Earlier turns summarized.\nExpand for details about: earlier turns", 1),
+    )
+    config = LCMConfig(
+        database_path=str(profile / "lcm.db"), fresh_tail_count=2,
+        leaf_chunk_tokens=1, incremental_max_depth=0,
+    )
+    db = core.SessionDB(db_path=profile / "state.db")
+    db.create_session(SID, "cli", model="test/model")
+    db.append_messages_batch(SID, [
+        {"role": "user" if index % 2 == 0 else "assistant",
+         "content": f"Original turn {index}: " + "history detail " * 80}
+        for index in range(6)
+    ])
+    original = db.get_messages_as_conversation(SID, repair_alternation=False)
+    original_snapshot = copy.deepcopy(original)
+    instance = LCMEngine(config=config, hermes_home=str(profile))
+    instance.on_session_start(SID, hermes_home=str(profile), context_length=200_000)
+    try:
+        instance._ingest_messages(original)
+        assert instance._ingest_cursor == 6
+        candidate = instance.compress(original)
+        assert original == original_snapshot
+        assert instance._last_compression_status == "compacted"
+        assert len(candidate) == 3 < len(original)
+        assert sum(count_message_tokens(row) for row in candidate) < sum(count_message_tokens(row) for row in original)
+        assert instance._ingest_cursor == len(candidate)
+        assert contents(instance) == [row["content"] for row in original]
+
+        # Simulate a host declining the proposal (or failing its archive): Core
+        # retains the original history rather than committing the short list.
+        assert db.get_messages_as_conversation(SID, repair_alternation=False) == original_snapshot
+        db.append_messages_batch(SID, [
+            {"role": row["role"], "content": row["content"]} for row in original[-2:]
+        ])
+        replay = db.get_messages_as_conversation(SID, repair_alternation=False)
+        assert len(replay) == 8
+        assert {row["message_uid"] for row in replay[-2:]}.isdisjoint(
+            row["message_uid"] for row in original
+        )
+        if restart:
+            close(instance)
+            instance = LCMEngine(config=config, hermes_home=str(profile))
+            instance.on_session_start(SID, hermes_home=str(profile), context_length=200_000)
+        replay_snapshot = copy.deepcopy(replay)
+        instance._ingest_messages(replay)
+        assert replay == replay_snapshot
+        # With a lowered cursor alone, the old suffix would be appended too.
+        assert instance._store.get_session_count(SID) == 8
+        assert contents(instance) == [row["content"] for row in replay]
+        instance._ingest_messages(copy.deepcopy(replay))
+        assert instance._store.get_session_count(SID) == 8
+    finally:
+        close(instance)
+        db.close()
+
+
 @pytest.mark.parametrize("identity", [
     {"message_uid": ""}, {"message_uid": 7},
     {"message_uid": "uid-a", "_absorbed_message_uids": "uid-b"},
