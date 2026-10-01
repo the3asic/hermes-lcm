@@ -26,11 +26,12 @@ atomic admission against every host cancellation race.
 ## Publication admission must share the host fence
 
 At the reviewed Core revision,
-[`CompressionCommitFence`](https://github.com/NousResearch/hermes-agent/blob/31150a3195fbdafbd5effcbf4885aaa2b6a4fa4d/agent/conversation_compression.py#L448)
+[`CompressionCommitFence`](../tests/fixtures/hermes_summary_dispatch_31150a3.py#L32)
+(frozen source excerpt, original `agent/conversation_compression.py:448`)
 serializes cancellation with host commit admission. Its `begin_commit` holds the
 fence until `finish_commit`. The
-[`_run_summary_dispatch`](https://github.com/NousResearch/hermes-agent/blob/31150a3195fbdafbd5effcbf4885aaa2b6a4fa4d/agent/conversation_compression.py#L3005)
-path installs an attempt-owned cancellation check on the compressor. A callback
+[`_run_summary_dispatch`](../tests/fixtures/hermes_summary_dispatch_31150a3.py#L246)
+excerpt (original `agent/conversation_compression.py:3005`) installs an attempt-owned cancellation check on the compressor. A callback
 check followed by a SQLite commit is still two operations: cancellation may
 arrive between them.
 
