@@ -567,8 +567,11 @@ class CompactionMixin:
             observed_tokens=observed_prompt_tokens,
             messages=working_messages,
         )
+        # Explicit debt catch-up has its own opt-in eligibility and pass budget;
+        # a simultaneous ingest cleanup must not starve it. Boundary cooldown
+        # still forbids summary work during a cleanup-only turn.
         deferred_maintenance_active = (
-            not ingest_cleanup_only
+            not (ingest_cleanup_only and cleanup_only_due_to_boundary_cooldown)
             and not force_overflow
             and not threshold_full_sweep_active
             and self._should_run_deferred_maintenance(
@@ -711,11 +714,11 @@ class CompactionMixin:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
 
-            if ingest_cleanup_only:
+            if ingest_cleanup_only and not deferred_maintenance_active:
                 # The deterministic scaffold/ignore/dependent-reply cleanup
-                # above must still run, but this maintenance pass may not cross
-                # into summary-producing work below the normal threshold (or
-                # while a compression-boundary cooldown is active). The common
+                # above must still run. Only independently eligible, explicitly
+                # enabled debt catch-up can permit summaries below the normal
+                # threshold; a boundary cooldown remains cleanup-only. The common
                 # no-leaf finalizer below sanitizes/reassembles from the DAG.
                 noop_reason = "ingest cleanup does not permit summary work"
                 break

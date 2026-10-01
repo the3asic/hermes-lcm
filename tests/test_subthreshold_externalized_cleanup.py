@@ -260,3 +260,54 @@ def test_overflow_tool_cleanup_still_runs_recovery(make_engine, monkeypatch):
     assert engine._dag.get_session_node_count(engine._session_id) >= 1
     assert engine.last_compression_status in {"compacted", "overflow_recovery"}
     assert summary_spy.call_count >= 1
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+@pytest.mark.parametrize(
+    "maintenance_enabled,record_debt,cooldown",
+    [(True, True, False), (False, True, False), (True, False, False), (True, True, True)],
+)
+def test_cleanup_preserves_only_eligible_bounded_deferred_maintenance(
+    make_engine, monkeypatch, preflight, maintenance_enabled, record_debt, cooldown,
+):
+    engine, messages = tool_cleanup_case(make_engine)
+    messages[1:3] = [
+        {"role": "user", "content": "old request one " * 20},
+        {"role": "assistant", "content": "old answer one " * 20},
+        {"role": "user", "content": "old request two " * 20},
+        {"role": "assistant", "content": "old answer two " * 20},
+    ]
+    engine._config.deferred_maintenance_enabled = maintenance_enabled
+    engine._config.deferred_maintenance_max_passes = 1
+    engine._config.dynamic_leaf_chunk_enabled = True
+    engine._config.dynamic_leaf_chunk_max = 1
+    if record_debt:
+        engine._lifecycle.record_debt(
+            engine._conversation_id,
+            kind="raw_backlog",
+            size_estimate=engine._raw_backlog_tokens(messages),
+        )
+    if cooldown:
+        engine._last_boundary_skip_time = time.time()
+    summary_spy = Mock(return_value=("bounded maintenance summary\nExpand for details about: old work", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    if preflight:
+        assert engine.should_compress_preflight(messages) is True
+    result = engine.compress(messages, current_tokens=engine.threshold_tokens // 4)
+
+    assert any(str(message.get("content", "")).startswith("[Externalized tool output:") for message in result)
+    permitted = maintenance_enabled and record_debt and not cooldown
+    state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+    assert state is not None
+    assert engine._dag.get_session_node_count(engine._session_id) == int(permitted)
+    assert summary_spy.call_count == int(permitted)
+    assert engine.compression_count == int(permitted)
+    if permitted:
+        assert state.last_maintenance_attempt_at is not None
+        assert state.debt_kind == "raw_backlog"
+        assert state.debt_size_estimate > 0
+        assert engine.last_compression_status == "compacted"
+    else:
+        assert state.last_maintenance_attempt_at is None
+        assert engine.last_compression_status == "sanitized"

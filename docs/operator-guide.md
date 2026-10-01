@@ -402,7 +402,9 @@ still ask the host to publish a sanitized replay (for example a recoverable
 tool-result ref or sensitive-value redaction), but that cleanup-only pass does
 not call the summarizer or create a DAG node. Manual ``force`` requests,
 overflow recovery, and explicitly enabled deferred maintenance keep their own
-compaction semantics.
+compaction semantics. Eligible deferred debt catch-up can run alongside cleanup
+within `LCM_DEFERRED_MAINTENANCE_MAX_PASSES`; a compression-boundary cooldown
+still keeps that cleanup turn free of summary work.
 
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the
