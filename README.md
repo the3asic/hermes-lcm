@@ -824,6 +824,7 @@ exposes retrieval tools that can drill back into exact stored sources.
 - [Embeddings setup](docs/embeddings-setup.md) — free-tier and local embedding
   providers, warmup, backfill
 - [LCM paper](https://papers.voltropy.com/LCM)
+- [Host prerequisites for further lossless-claw adaptations](docs/lossless-claw-host-contract.md) — proposed cancellation, event identity, receipts, and background execution contract.
 - [Architecture diagram](docs/architecture.png)
 - [Standard compression diagram](docs/standard_compression.png)
 - [LCM compression diagram](docs/lcm_compression.png)
