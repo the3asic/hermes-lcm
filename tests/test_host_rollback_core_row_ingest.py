@@ -105,3 +105,13 @@ def test_no_core_identity_is_not_content_deduplicated(engine):
         message.pop("_row_id")
     engine.ingest(replay)
     assert len(rows(engine)) == len(before) + 3
+
+
+@pytest.mark.parametrize("shared_object", [False, True])
+def test_repeated_core_id_is_only_proof_of_one_occurrence(engine, shared_object):
+    original, before = compress_then_host_rollback(engine)
+    replay = copy.deepcopy(original)
+    replay.append(replay[3] if shared_object else copy.deepcopy(replay[3]))
+    engine.ingest(replay)
+    assert len(rows(engine)) == len(before) + 1
+    assert rows(engine)[-1]["content"] == original[3]["content"]
