@@ -5,6 +5,16 @@ import time
 import contextlib
 import contextvars
 import logging
+from typing import Any, Callable, Optional
+
+# Test loaders inject these host-owned dependencies before dispatch.
+def _mark_compressor_working_attempt(*args: Any) -> None:
+    raise RuntimeError("host fixture loader must inject attempt ownership")
+
+
+class AuxiliaryExplicitCancellation(RuntimeError):
+    """Placeholder; the loader injects the host cancellation exception."""
+
 logger=logging.getLogger(__name__)
 _COMPRESSOR_ATTEMPT_LOCK=threading.RLock()
 _COMPRESSOR_ATTEMPT_GENERATION=contextvars.ContextVar("test_attempt",default=0)

@@ -459,7 +459,8 @@ def test_repeated_registration_keeps_one_dispatcher_and_releases_old_engines(rou
     import gc
     import weakref
     host = routed_plugin
-    external = lambda **kwargs: None
+    def external(**kwargs):
+        return None
     host.manager._hooks["post_llm_call"] = [external]
     retired = []
     for _ in range(100):
@@ -506,7 +507,8 @@ def test_dispatcher_preserves_other_profiles_and_manager_namespaces(routed_plugi
         session_id="unknown", conversation_history=[{"role": "user", "content": "unknown"}],
     )
     assert all(engine._store.get_session_messages("unknown") == [] for engine in prototypes.values())
-    other = lambda **kwargs: None
+    def other(**kwargs):
+        return None
     other._lcm_ingest_namespace = "other_plugin_namespace"
     host.manager._hooks["post_llm_call"].append(other)
     host.module.register(host.ctx)
