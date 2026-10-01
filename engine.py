@@ -5121,6 +5121,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
+        # A host can reject its commit after compress() rebased our cursor.
+        # Its next input then contains the original durable Core occurrences,
+        # not the shorter assembly. Reuse the existing verified ID bridge;
+        # content alone must never discard a genuinely repeated user message.
+        core_origins = self._validated_core_row_origins(messages)
+        origins = self._active_replay_store_origins.copy()
+        for original, active in zip(messages, active_replay_messages):
+            source_id = core_origins.get(id(original))
+            if source_id is not None:
+                for message in (original, active):
+                    origins[id(message)] = (message, source_id, self._session_id)
+        self._active_replay_store_origins = origins
+        messages_to_store_with_index = [
+            (index, message) for index, message in messages_to_store_with_index
+            if id(messages[index]) not in core_origins
+        ]
+
         if not messages_to_store_with_index:
             self._ingest_cursor = n
             self._compression_boundary_ingest_pending = False
