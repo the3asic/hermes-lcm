@@ -2,6 +2,11 @@
 
 This repo also publishes GitHub Releases. This file is the repo-root release surface for operators who want the recent release arc without leaving the checkout.
 
+For the ABM fork, follow the [fork release policy](CONTRIBUTING.md#fork-release-policy)
+and record an exact Core/LCM pair for production acceptance. The dated entries
+below retain the original project's release history; they do not replace this
+fork's reviewed release and recovery procedure.
+
 ## Unreleased
 
 No additional changes yet.
@@ -49,6 +54,14 @@ No additional changes yet.
   is required, and a stock/default-off upgrade creates no optional feature
   tables. Restore the pre-upgrade snapshot before downgrading if an optional
   store was enabled after the update.
+
+  **ABM fork recovery clarification:** restore that older snapshot only into a
+  separate offline candidate after preserving verified consistent copies of
+  current history, newer messages, and referenced payloads. Follow the
+  [version-specific preservation and recovery procedure](docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1);
+  never automatically overwrite production with an older snapshot. Any
+  production database replacement or loss of active history requires separate
+  explicit approval.
 
 ## v0.21.0-rc2 - 2026-08-05
 
@@ -159,6 +172,7 @@ Release focus: engine isolation, WAL durability, database-path clarity, and star
 
 ## Links
 
-- GitHub Releases: https://github.com/stephenschoettler/hermes-lcm/releases
+- ABM fork GitHub Releases: https://github.com/the3asic/hermes-lcm/releases
+- Original project release history: https://github.com/stephenschoettler/hermes-lcm/releases
 - Release workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 - Validation expectations: [`CONTRIBUTING.md`](CONTRIBUTING.md)

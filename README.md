@@ -2,12 +2,18 @@
   <img src="docs/banner.png" alt="HERMES-LCM" width="800">
 </p>
 
-[![CI](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/stephenschoettler/hermes-lcm)](https://github.com/stephenschoettler/hermes-lcm/releases)
-[![Python 3.11-3.14](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml)
+[![CI](https://github.com/the3asic/hermes-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/the3asic/hermes-lcm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/the3asic/hermes-lcm)](https://github.com/the3asic/hermes-lcm/releases)
+[![Python 3.11-3.14](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](https://github.com/the3asic/hermes-lcm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Lossless Context Management plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
+
+**ABM production fork:** [`the3asic/hermes-lcm`](https://github.com/the3asic/hermes-lcm).
+`main` is the official release line; production acceptance is recorded against
+an exact LCM and Hermes Core commit pair. See the
+[fork release policy](CONTRIBUTING.md#fork-release-policy).
+Original project: [`stephenschoettler/hermes-lcm`](https://github.com/stephenschoettler/hermes-lcm).
 
 > Bounded context, unbounded memory. Nothing is ever lost.
 
@@ -143,14 +149,14 @@ that the host's resolved environment is free of known vulnerabilities.
 Canonical install path: clone `hermes-lcm` as a general user plugin.
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+git clone --branch main https://github.com/the3asic/hermes-lcm \
   ~/.hermes/plugins/hermes-lcm
 ```
 
 For a profile-specific install:
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+git clone --branch main https://github.com/the3asic/hermes-lcm \
   ~/.hermes/profiles/myprofile/plugins/hermes-lcm
 ```
 
@@ -229,6 +235,12 @@ there.
 
 ### Update it
 
+Production updates follow the [fork release policy](CONTRIBUTING.md#fork-release-policy).
+The pull commands below and `scripts/update.sh` use the current branch's
+configured tracking upstream. Confirm that it points to this fork's `main`,
+select the reviewed commit, and use controlled deployment and acceptance before
+calling an update production-ready.
+
 If you cloned directly into the plugin directory:
 
 ```bash
@@ -247,10 +259,13 @@ If you installed a symlink from a separate checkout:
 ./scripts/update.sh
 ```
 
-Restart Hermes after updating.
+Runtime changes require the existing idle/drain and restart procedure. For
+documentation-only or identical-runtime history changes, verify unchanged
+runtime files and keep Hermes running with its actual startup identity.
 
-For the `v1.0.0-rc.1` line, take a normal backup of `lcm.db` before updating,
-then update the checkout and restart Hermes. No manual core migration or
+For runtime updates on the `v1.0.0-rc.1` line, take a verified consistent backup
+of `lcm.db`, then update the checkout and restart Hermes through the controlled
+procedure. No manual core migration or
 backfill is required: the core schema remains version 5. New assertion,
 query-view, and adaptive-retrieval state is additive, created only after the
 corresponding opt-in is enabled, and stored in the same profile database under
@@ -831,7 +846,7 @@ exposes retrieval tools that can drill back into exact stored sources.
 - [Contributing guide](CONTRIBUTING.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
 - [Security policy](SECURITY.md)
-- [Releases](https://github.com/stephenschoettler/hermes-lcm/releases)
+- [Releases](https://github.com/the3asic/hermes-lcm/releases)
 
 ## Development
 
@@ -868,7 +883,7 @@ priority. New features should be scoped, backwards-compatible, and tested.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch, validation, and PR guidance.
 See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for project conduct expectations
 and [SECURITY.md](SECURITY.md) for vulnerability reporting.
-See the [releases page](https://github.com/stephenschoettler/hermes-lcm/releases)
+See the [releases page](https://github.com/the3asic/hermes-lcm/releases)
 for changelogs.
 
 ## License

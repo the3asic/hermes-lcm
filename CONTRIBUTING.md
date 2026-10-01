@@ -4,6 +4,48 @@ Thanks for contributing.
 
 This project is small, review-driven, and correctness-first. Keep changes scoped, tested, and easy to reason about.
 
+## Fork release policy
+
+For [`the3asic/hermes-lcm`](https://github.com/the3asic/hermes-lcm), `main` is
+the official release line. A merged commit becomes a verified production version
+only after controlled deployment and real-conversation acceptance with a
+compatible Hermes Core commit. Record the merged and deployed LCM SHAs, the Core
+SHA, and the acceptance result; merging or successful startup alone is not
+production acceptance.
+
+Develop each independent change on a focused branch and submit a PR to `main`.
+GitHub branch protection requires PRs, applies to administrators, and prohibits
+force pushes and branch deletion. Required status checks are not configured:
+reviewers must inspect the relevant validation results. Failed, skipped,
+cancelled, or missing checks must not be reported as passing. Explain validation
+limits, and resolve real failures in affected runtime paths before deployment.
+Document any pre-existing failures separately with evidence.
+
+Use validation proportionate to the change. Runtime changes require relevant
+tests and the existing release checks below. Documentation-only changes can use
+`git diff --check` and link verification without rerunning pytest. Hotfixes follow
+the same review, validation, controlled deployment, and acceptance gates.
+Documentation-only or identical-runtime history changes do not require a restart;
+prove the runtime files match and retain the actual process startup identity.
+
+Review upstream changes through focused PRs instead of blindly synchronizing
+upstream `main`. Before deployment, inspect the actual production checkout and
+runtime, preserve a known rollback commit and verified recovery material, and
+deploy the exact reviewed merge commit through the existing controlled procedure.
+Normal rollback changes code only, retaining the live databases and newer
+messages; never automatically replace live history with an older backup.
+For a documented downgrade that cannot open the newer database safely, do not
+start incompatible code on the live file. Preserve verified, consistent snapshots
+of the current database and its newer history and payloads first. Restore the
+pre-upgrade backup into a separate offline candidate, verify its integrity and
+compatibility, and define how newer history will remain available. Any production
+database replacement or loss of active history needs separate explicit approval;
+a routine code rollback does not authorize it. See the
+[version-specific upgrade and recovery guidance](docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1).
+
+This policy uses the existing tests, release workflow, and deployment process;
+it adds no services, dependencies, or automatic deployment.
+
 ## Workflow
 
 Preferred flow:
@@ -126,7 +168,7 @@ Packaging or install-flow changes should also verify the standalone user-plugin 
 ```bash
 export HERMES_HOME=/tmp/hermes-lcm-smoke
 mkdir -p "$HERMES_HOME/plugins"
-git clone https://github.com/stephenschoettler/hermes-lcm "$HERMES_HOME/plugins/hermes-lcm"
+git clone --branch main https://github.com/the3asic/hermes-lcm "$HERMES_HOME/plugins/hermes-lcm"
 # then enable `hermes-lcm` in plugins.enabled and set context.engine: lcm
 hermes plugins
 ```
