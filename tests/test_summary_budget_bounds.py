@@ -1,5 +1,4 @@
 """Summary acceptance must meet size caps as well as existing quality floors."""
-import pytest
 from hermes_lcm import escalation
 from hermes_lcm.tokens import count_tokens
 

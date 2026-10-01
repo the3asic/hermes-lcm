@@ -2,6 +2,16 @@
 # Source: NousResearch/hermes-agent at 31150a3195fbdafbd5effcbf4885aaa2b6a4fa4d (MIT).
 from __future__ import annotations
 import contextlib
+import logging
+from typing import Any, Optional
+
+# Test loaders inject these host-owned dependencies before invoking excerpts.
+logger = logging.getLogger(__name__)
+
+
+def is_truthy_value(value: Any) -> bool:
+    raise RuntimeError("host fixture loader must inject is_truthy_value")
+
 
 # tui_gateway/session_compression.py
 def _compressor_ctor_default(name: str, fallback: Any) -> Any:
@@ -78,7 +88,7 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
-    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}  # noqa: F841 - pinned host excerpt
     from agent.agent_init import config_context_length_for_runtime, set_config_context_length
     enabled_raw = compression.get("enabled", True)
     agent.compression_enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes"}
