@@ -96,42 +96,32 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
-    """Configure SQLite connection for WAL durability and hygiene.
+    """Use the host journal policy, FULL sync, and bounded WAL housekeeping.
 
-    In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
-    every process opens its own sqlite3.Connection pointing at the same
-    lcm.db file.  These settings improve committed-write durability and WAL
-    hygiene, but do NOT make sibling processes safe from an unexpected process
-    death.  Abnormal exit still depends on normal SQLite WAL recovery;
-    application-level checkpoints only run during graceful shutdown (see
-    ``MessageStore.close()`` etc.).
-
-    Key design decisions:
-    - journal_mode=WAL  : writes go to a separate log; readers never block.
-    - synchronous=FULL  : fsync both the WAL and the WAL index before every
-                          write transaction commit.  WAL + FULL is the only
-                          combination SQLite guarantees survives power loss
-                          without data loss (NORMAL may lose the WAL index).
-    - wal_autocheckpoint=500 : after 500 WAL pages (~2 MB) SQLite will try
-                               an automatic passive checkpoint.  This is a
-                               best-effort hint — it is silently skipped when
-                               another connection holds a read transaction.
-                               Under checkpoint starvation WAL can grow well
-                               beyond this trigger.
-    - journal_size_limit=67108864 (64 MiB) : limits the WAL file size after
-                                             a successful checkpoint or reset.
-                                             It does NOT force a checkpoint
-                                             or cap growth while another
-                                             connection holds an old WAL
-                                             end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    Old hosts without the shared helper keep the bounded legacy WAL conversion.
+    Native policy can select DELETE or retain an existing WAL database; LCM never
+    independently downgrades a live database. Graceful checkpoints remain hints,
+    and SQLite recovery owns abrupt process exit.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    _execute_wal_conversion_with_lock_retry(conn)
+    try:
+        from hermes_state_wal import apply_wal_with_fallback
+    except ImportError:
+        # Compatibility for older supported Hermes hosts that predate the
+        # shared helper, and for the standalone plugin test environment.
+        _execute_wal_conversion_with_lock_retry(conn)
+    else:
+        apply_wal_with_fallback(conn, db_label="lcm.db")
+
+    # The host can return an assumed mode after a blocked probe. Use SQLite
+    # readback for WAL-specific settings; failed readback must remain visible.
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    mode = str(row[0]).lower() if row else ""
+
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
+    if mode == "wal":
+        conn.execute("PRAGMA wal_autocheckpoint=500")
+        conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
 
 
