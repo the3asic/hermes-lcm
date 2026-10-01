@@ -2360,6 +2360,13 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
     return _bounded_recent_json(response, sections)
 
 
+def _search_argument_text(value: Any) -> str:
+    """Normalize query text without turning null/containers into search terms."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return ""
+    return str(value).strip()
+
+
 def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     """Search raw messages + summaries with optional cross-session scoping.
 
@@ -2375,7 +2382,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    query = args.get("query", "").strip()
+    query = _search_argument_text(args.get("query"))
     if not query:
         return json.dumps({"error": "No query provided"})
 
@@ -3064,7 +3071,7 @@ def _lcm_grep_semantic(
     mode = str(args.get("mode") or "semantic").lower()
     if time.monotonic() >= deadline:
         return _lcm_grep_deadline_error(mode, "semantic_entry")
-    query = str(args.get("query", "")).strip()
+    query = _search_argument_text(args.get("query"))
     if not query:
         return {"error": "No query provided"}
 
@@ -4595,7 +4602,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    query = str(args.get("query", "")).strip()
+    query = _search_argument_text(args.get("query"))
     if not query:
         return json.dumps({"error": "No query provided"})
 
@@ -5514,7 +5521,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    prompt = str(args.get("prompt") or "").strip()
+    prompt = _search_argument_text(args.get("prompt"))
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
@@ -5540,7 +5547,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": max_results_error})
     max_results = max(1, int(max_results or 5))
 
-    query = str(args.get("query") or "").strip()
+    query = _search_argument_text(args.get("query"))
     raw_node_ids = args.get("node_ids") or []
 
     nodes = []
