@@ -20914,7 +20914,7 @@ class TestAssemblyGuardrails:
 
         contents = [msg["content"] for msg in result[1:]]
         assert any("a" * 20 in content for content in contents)
-        assert not any(msg.get("role") == "user" and msg.get("content") == "a" * 20 for msg in result[1:])
+        assert any(msg.get("role") == "user" and msg.get("content") == "a" * 20 for msg in result[1:])
 
     def test_context_anchor_is_budgeted_under_max_assembly_tokens(self, tmp_path, monkeypatch):
         import importlib
@@ -21053,7 +21053,8 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=90)
 
-        assert result == [messages[0], messages[-1]]
+        # The actual user request outranks derived assistant text under the cap.
+        assert result == [messages[0], messages[1]]
         assert instance.compression_count == 1
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
@@ -21090,7 +21091,8 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=100)
 
-        assert result == [messages[0], messages[-1]]
+        # The actual user request outranks derived assistant text under the cap.
+        assert result == [messages[0], messages[1]]
         assert lcm_engine_module.count_messages_tokens(result) < 70
 
     def test_forced_overflow_recovery_does_not_duplicate_existing_summary_message(self, tmp_path, monkeypatch):
