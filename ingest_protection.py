@@ -167,20 +167,15 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     ),
 }
 
-# Sensitive redaction runs synchronously in the ingest path. The private_key
-# pattern (lazy `.*?` under DOTALL) rescans to end-of-string for every unmatched
-# BEGIN header, so a multi-MB payload with many headers and no END is O(n^2) and
-# can block a turn for minutes. Guard it: prefer the optional `regex` engine with
-# a match timeout (fail-open on timeout), and when `regex` is unavailable bound
-# the input length the stdlib DOTALL pattern is applied to.
+# Preserve the optional regex helper for compatibility; private-key ingest
+# now uses the linear scanner directly, without paying a timeout first.
 try:  # pragma: no cover - exercised when the optional dependency is absent
     import regex as _regex_engine
 except Exception:  # pragma: no cover - keep the plugin importable in minimal installs
     _regex_engine = None
 
 _SENSITIVE_MATCH_TIMEOUT_SECONDS = 1.0
-# Legitimate PEM keys are a few KB; above this a DOTALL rescan is the attack, not
-# a real key, so fail-open rather than block ingest.
+# Legacy regex bounds retained for compatibility with diagnostic callers.
 _SENSITIVE_STDLIB_MAX_CHARS = 262_144
 _BACKTRACKING_RISKY_SENSITIVE_PATTERNS = frozenset({"private_key"})
 _SENSITIVE_TIMEOUT_WARNED: set[str] = set()
@@ -217,38 +212,10 @@ def _regex_pattern_for(name: str) -> Any:
 
 
 def _apply_sensitive_pattern(name: str, repl, text: str) -> str:
-    """Substitute one sensitive pattern with a ReDoS-safe strategy.
-
-    Fails open (leaves the span unredacted) with a one-time warning rather than
-    blocking the ingest path on a pathological input.
-    """
-    # Only the private_key pattern (lazy `.*?` under DOTALL, which rescans to
-    # end-of-string per unmatched BEGIN header) is O(n^2) and needs a guard.
-    # The other patterns are character-class-bounded and linear, so they always
-    # run via stdlib and never fail open - a redaction bypass under CPU load
-    # would be a silent secret leak, so we restrict fail-open to the one
-    # pattern that genuinely requires it.
-    if name in _BACKTRACKING_RISKY_SENSITIVE_PATTERNS:
-        regex_pattern = _regex_pattern_for(name)
-        if regex_pattern is not None:
-            try:
-                return regex_pattern.sub(
-                    repl, text, timeout=_SENSITIVE_MATCH_TIMEOUT_SECONDS
-                )
-            except TimeoutError:
-                if name not in _SENSITIVE_TIMEOUT_WARNED:
-                    _SENSITIVE_TIMEOUT_WARNED.add(name)
-                    logger.warning(
-                        "LCM sensitive redaction %r timed out after %.3gs; leaving "
-                        "span unredacted for this input",
-                        name,
-                        _SENSITIVE_MATCH_TIMEOUT_SECONDS,
-                    )
-                return _redact_private_key_blocks(text)
-        elif name == "private_key":
-            return _redact_private_key_blocks(text)
+    """Substitute sensitive spans without a quadratic PEM regex pass."""
+    if name == "private_key":
+        return _redact_private_key_blocks(text)
     return _SENSITIVE_PATTERN_CATALOG[name].sub(repl, text)
-
 
 
 
