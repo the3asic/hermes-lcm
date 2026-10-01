@@ -259,10 +259,13 @@ If you installed a symlink from a separate checkout:
 ./scripts/update.sh
 ```
 
-Restart Hermes after updating.
+Runtime changes require the existing idle/drain and restart procedure. For
+documentation-only or identical-runtime history changes, verify unchanged
+runtime files and keep Hermes running with its actual startup identity.
 
-For the `v1.0.0-rc.1` line, take a normal backup of `lcm.db` before updating,
-then update the checkout and restart Hermes. No manual core migration or
+For runtime updates on the `v1.0.0-rc.1` line, take a verified consistent backup
+of `lcm.db`, then update the checkout and restart Hermes through the controlled
+procedure. No manual core migration or
 backfill is required: the core schema remains version 5. New assertion,
 query-view, and adaptive-retrieval state is additive, created only after the
 corresponding opt-in is enabled, and stored in the same profile database under

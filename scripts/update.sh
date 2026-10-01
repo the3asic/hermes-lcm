@@ -10,4 +10,5 @@ fi
 
 "$SCRIPT_DIR/install.sh"
 
-echo "Update complete. Restart Hermes if it is running."
+echo "Update complete. Runtime changes require the controlled Hermes restart procedure."
+echo "For docs/history-only changes, verify unchanged runtime files and keep Hermes running."
