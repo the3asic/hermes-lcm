@@ -602,10 +602,11 @@ def _llm_summary_is_acceptable(
     source_tokens: int,
     min_source_tokens: int,
     min_result_tokens: int,
+    max_result_tokens: int,
 ) -> bool:
     """Return whether an LLM summary is safe to persist as a summary node."""
     result_tokens = count_tokens(result)
-    if result_tokens >= source_tokens:
+    if result_tokens >= source_tokens or result_tokens > max_result_tokens:
         return False
     if (
         min_source_tokens > 0
@@ -671,6 +672,7 @@ def summarize_with_escalation(
             source_tokens=source_tokens,
             min_source_tokens=large_source_summary_min_source_tokens,
             min_result_tokens=large_source_summary_min_result_tokens,
+            max_result_tokens=token_budget,
         ),
     )
 
@@ -702,6 +704,7 @@ def summarize_with_escalation(
             source_tokens=source_tokens,
             min_source_tokens=large_source_summary_min_source_tokens,
             min_result_tokens=large_source_summary_min_result_tokens,
+            max_result_tokens=l2_budget,
         ),
     )
 
@@ -710,6 +713,6 @@ def summarize_with_escalation(
         return l2_result, 2
 
     # Level 3: deterministic truncation — guaranteed convergence
-    l3_result = _deterministic_truncate(text, l3_truncate_tokens)
+    l3_result = _deterministic_truncate(text, min(l3_truncate_tokens, token_budget))
     logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
     return l3_result, 3
