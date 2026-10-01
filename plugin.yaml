@@ -18,3 +18,9 @@ provides_tools:
   - lcm_status
   - lcm_inspect
   - lcm_doctor
+
+# Context-engine schemas remain available on message-blind hosts.
+provides_hooks:
+  - pre_llm_call
+  - subagent_start
+  - subagent_stop
