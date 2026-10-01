@@ -239,7 +239,12 @@ class ReconcileMixin:
                 source_index = None
             source_indices.append(source_index)
         selected = [index for index in source_indices if type(index) is int]
-        if not sign_projection or not selected or selected == list(range(min(selected), len(source_messages))):
+        if not sign_projection or not selected:
+            return cleaned
+        # Core's successful archive gives carried rows fresh IDs. Even a
+        # contiguous tail needs durable source receipts after a cold reload.
+        # Keep an already certified projection stable when reassembling it.
+        if self._reconcile_assembled_replay_cursor(cleaned) == len(cleaned):
             return cleaned
         # Never certify an unknown raw occurrence or let the receipt change a
         # host-owned non-dictionary display value.

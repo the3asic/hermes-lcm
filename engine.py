@@ -6582,7 +6582,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         return self._remember_assembled_replay(
             result, assembly_source_messages, assembly_id=assembly_id,
-            sign_projection=budget_projection_dropped,
+            sign_projection=budget_projection_dropped or bool(summary_parts),
         )
 
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:

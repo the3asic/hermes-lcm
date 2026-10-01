@@ -5019,6 +5019,44 @@ class TestAssemblyBudgetSelection:
         replay._ingest_messages(reassembled)
         assert replay._store.get_session_count("assembly-session") == len(original)
 
+    @pytest.mark.parametrize("change", ["new_row_ids", "same_text_new_turn", "edited_tail"])
+    def test_summary_contiguous_tail_survives_core_row_id_replacement(self, tmp_path, monkeypatch, change):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=4000)
+        original = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old question", "_row_id": 10},
+            {"role": "assistant", "content": "old answer", "_row_id": 11},
+            {"role": "user", "content": "carried question", "_row_id": 12},
+            {"role": "assistant", "content": "carried answer", "_row_id": 13},
+        ]
+        engine._ingest_messages(original)
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session", depth=0, summary="old exchange summary",
+            token_count=5, source_token_count=20, source_ids=[2, 3],
+            source_type="messages", expand_hint="old exchange",
+        ))
+        assembled = engine._assemble_context(original[0], original[-2:])
+        assert all("lcm_assembly_replay" in msg.get("display_metadata", {}) for msg in assembled)
+        # Core archive materializes a new durable transcript with new row IDs.
+        cold = copy.deepcopy(assembled)
+        for index, message in enumerate(cold):
+            message["_row_id"] = 100 + index
+        expected_delta = 0
+        if change == "same_text_new_turn":
+            cold.append({"role": "user", "content": original[-2]["content"], "_row_id": 200})
+            expected_delta = 1
+        elif change == "edited_tail":
+            cold[-1]["content"] = "edited carried answer"
+            expected_delta = 1
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(cold)
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + expected_delta
+        if change == "same_text_new_turn":
+            assert sum(row["content"] == original[-2]["content"] for row in rows) == 2
+        elif change == "edited_tail":
+            assert rows[-1]["content"] == "edited carried answer"
+
     def test_reused_tool_ids_sign_the_actual_raw_occurrence(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=240)
         call = {"id": "reused", "type": "function", "function": {"name": "probe", "arguments": "{}"}}
