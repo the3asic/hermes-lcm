@@ -6429,9 +6429,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_selected = assembly_tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
-            anchor_source = tail_messages
+            anchor_source = assembly_source_messages
         anchor_part: Optional[str] = None
         summary_budget = None
+        budget_projection_dropped = False
         if assembly_cap is not None:
             used = count_message_tokens(leading_msg) if leading_msg is not None else 0
             tail_for_selection = self._sanitize_active_context_messages(
@@ -6439,10 +6440,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 insert_missing_tool_stubs=False,
             )
             tail_selected = self._select_atomic_tail_groups(tail_for_selection, max(0, assembly_cap - used))
+            budget_projection_dropped = len(tail_selected) < len(tail_for_selection)
             tail_token_total = count_messages_tokens(tail_selected)
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
-            anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
+            selected_source_messages = [
+                assembly_source_messages[index]
+                for message in tail_selected
+                for metadata in [message.get("display_metadata")]
+                if isinstance(metadata, dict)
+                for index in [metadata.get(_ASSEMBLY_SOURCE_INDEX_KEY)]
+                if type(index) is int
+            ]
+            anchor_part = self._latest_user_context_anchor(anchor_source, selected_source_messages)
 
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
@@ -6546,6 +6556,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         return self._remember_assembled_replay(
             result, assembly_source_messages, assembly_id=assembly_id,
+            sign_projection=budget_projection_dropped,
         )
 
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:

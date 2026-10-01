@@ -215,6 +215,7 @@ class ReconcileMixin:
 
     def _remember_assembled_replay(
         self, result: List[Dict[str, Any]], source_messages: List[Dict[str, Any]], *, assembly_id: str,
+        sign_projection: bool = True,
     ) -> List[Dict[str, Any]]:
         """Sign a non-contiguous assembly using its original structured source map."""
         cleaned = []
@@ -238,7 +239,7 @@ class ReconcileMixin:
                 source_index = None
             source_indices.append(source_index)
         selected = [index for index in source_indices if type(index) is int]
-        if not selected or selected == list(range(min(selected), len(source_messages))):
+        if not sign_projection or not selected or selected == list(range(min(selected), len(source_messages))):
             return cleaned
         # Never certify an unknown raw occurrence or let the receipt change a
         # host-owned non-dictionary display value.
