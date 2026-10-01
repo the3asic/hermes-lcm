@@ -267,7 +267,17 @@ class ReconcileMixin:
             if id(msg) in origins and origins[id(msg)][0] is msg
             and origins[id(msg)][2] == self._session_id
         }
-        ids_by_message_id.update(self._validated_core_row_origins(source_messages))
+        core_proofs = self._validated_core_row_origins(source_messages)
+        ids_by_message_id.update(core_proofs)
+        ordered_projection_proofs = dict(core_proofs)
+        if self._reconcile_assembled_replay_cursor(source_messages) == len(source_messages):
+            # An already signed ORDERED assembly remains certified after Core
+            # replaces its IDs again. Singleton receipts cannot prove order.
+            for source in source_messages:
+                metadata = source.get("display_metadata")
+                receipt = metadata.get(_ASSEMBLY_REPLAY_KEY) if isinstance(metadata, dict) else None
+                if isinstance(receipt, dict) and type(receipt.get("source_id")) is int:
+                    ordered_projection_proofs[id(source)] = receipt["source_id"]
         for index in selected:
             source = source_messages[index]
             metadata = source.get("display_metadata")
@@ -279,6 +289,23 @@ class ReconcileMixin:
             unique_ids = self._get_store_id_map_for_messages(source_messages, require_unique=True)
             for message_id, source_id in unique_ids.items():
                 ids_by_message_id.setdefault(message_id, source_id)
+        selected_ids = [ids_by_message_id.get(id(source_messages[index])) for index in selected]
+        core_order = False
+        if all(type(source_id) is int and source_id > 0 for source_id in selected_ids):
+            core_order = selected_ids != sorted(selected_ids)
+        if core_order:
+            # Legacy replay can append earlier Core occurrences after later
+            # raw rows. Certify that order only through the durable Core bridge,
+            # never a content mapper or an uncommitted in-memory association.
+            core_ids = [source_messages[index].get("_row_id") for index in selected]
+            if (
+                len(set(selected_ids)) != len(selected_ids)
+                or any(type(row_id) is not int or row_id <= 0 for row_id in core_ids)
+                or core_ids != sorted(set(core_ids))
+                or any(ordered_projection_proofs.get(id(source_messages[index])) != source_id
+                       for index, source_id in zip(selected, selected_ids))
+            ):
+                return cleaned
         entries = []
         last_store_id = 0
         for message, source_index in zip(cleaned, source_indices):
@@ -286,14 +313,17 @@ class ReconcileMixin:
             source_digest = None
             if type(source_index) is int:
                 source_id = ids_by_message_id.get(id(source_messages[source_index]))
-                if type(source_id) is not int or source_id <= last_store_id:
+                if type(source_id) is not int or source_id <= 0 or (not core_order and source_id <= last_store_id):
                     return cleaned
                 row = self._store.get(source_id)
                 if not row or row.get("session_id") != self._session_id:
                     return cleaned
                 row_identity = self._message_replay_identity(row, stored_row=True)
                 source_identity = self._message_replay_identity(source_messages[source_index])
-                if source_identity != row_identity:
+                # Core reload can strip a timestamp or sanitize whitespace.
+                # Accept that view only when the exact durable Core-ID bridge
+                # already validates BOTH source and this emitted output digest.
+                if source_identity != row_identity and ordered_projection_proofs.get(id(source_messages[source_index])) != source_id:
                     return cleaned
                 source_digest = self._assembly_replay_digest(row_identity)
                 last_store_id = source_id
@@ -307,6 +337,12 @@ class ReconcileMixin:
                     self._assembly_replay_output_digest(message, core_view=True),
                 }),
             })
+            if core_order:
+                # This signed structured ID proves source occurrence order;
+                # the carried output receives a different Core ID on archive.
+                entries[-1]["core_source_row_id"] = (
+                    source_messages[source_index]["_row_id"] if type(source_index) is int else None
+                )
         signing_key = self._assembly_replay_signing_key(create=True)
         if signing_key is None:
             return cleaned
@@ -333,18 +369,28 @@ class ReconcileMixin:
         assembly_id = None
         last_ordinal = -1
         last_store_id = 0
+        last_core_source_row_id = 0
+        used_source_ids = set()
+        core_order_mode = None
         cursor = 0
         for message, receipt in zip(messages, receipts):
             if receipt is None and id(message) in core_origins:
                 source_id = core_origins[id(message)]
-                if source_id <= last_store_id:
+                if source_id <= last_store_id or source_id in used_source_ids:
                     break
                 last_store_id = source_id
+                used_source_ids.add(source_id)
                 cursor += 1
                 continue
-            if not isinstance(receipt, dict) or set(receipt) != {
+            base_fields = {
                 "assembly_id", "ordinal", "source_id", "source_digest", "output_digests", "mac",
-            }:
+            }
+            if not isinstance(receipt, dict) or set(receipt) not in (
+                base_fields, base_fields | {"core_source_row_id"},
+            ):
+                break
+            core_order = "core_source_row_id" in receipt
+            if core_order_mode is not None and core_order != core_order_mode:
                 break
             ordinal = receipt.get("ordinal")
             source_id = receipt.get("source_id")
@@ -356,7 +402,18 @@ class ReconcileMixin:
                 or (assembly_id is not None and nonce != assembly_id)
                 or not isinstance(digests, list) or not 1 <= len(digests) <= 2
                 or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests)
-                or (source_id is not None and (type(source_id) is not int or source_id <= last_store_id))
+                or (source_id is not None and (
+                    type(source_id) is not int or source_id <= 0 or source_id in used_source_ids
+                    or (not core_order and source_id <= last_store_id)
+                ))
+            ):
+                break
+            core_source_row_id = receipt.get("core_source_row_id")
+            if core_order and (
+                (source_id is None and core_source_row_id is not None)
+                or (source_id is not None and (
+                    type(core_source_row_id) is not int or core_source_row_id <= last_core_source_row_id
+                ))
             ):
                 break
             entry = {key: value for key, value in receipt.items() if key != "mac"}
@@ -374,9 +431,13 @@ class ReconcileMixin:
                 ):
                     break
                 last_store_id = source_id
+                used_source_ids.add(source_id)
+                if core_order:
+                    last_core_source_row_id = core_source_row_id
             elif receipt.get("source_digest") is not None:
                 break
             assembly_id = nonce
+            core_order_mode = core_order
             last_ordinal = ordinal
             cursor += 1
         return cursor

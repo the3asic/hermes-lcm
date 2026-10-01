@@ -5088,6 +5088,139 @@ class TestAssemblyBudgetSelection:
         replay._ingest_messages(assembled)
         assert replay._store.get_session_count("assembly-session") == len(messages)
 
+    def _legacy_interleaved_core_assembly(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=4000)
+        old = [
+            {"role": "user", "content": "prior question", "_row_id": 20},
+            {"role": "assistant", "content": "prior answer", "_row_id": 21},
+        ]
+        engine._ingest_messages(old)
+        messages = [{"role": "user", "content": "legacy earlier question", "_row_id": 19}] + old
+        engine._ingest_cursor_needs_reconcile = True
+        engine._ingest_messages(messages)
+        assert [engine._validated_core_row_origins(messages)[id(m)] for m in messages] == [3, 1, 2]
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session", summary="earlier summary", token_count=5,
+            source_ids=[1], expand_hint="earlier details",
+        ))
+        return engine, messages
+
+    @pytest.mark.parametrize("change", ["none", "new_identical_turn", "edited", "other_scope"])
+    def test_legacy_core_order_survives_another_archive_and_reload(self, tmp_path, monkeypatch, change):
+        engine, messages = self._legacy_interleaved_core_assembly(tmp_path, monkeypatch)
+        assembled = engine._assemble_context(None, messages)
+        assert all("lcm_assembly_replay" in m.get("display_metadata", {}) for m in assembled)
+        cold = copy.deepcopy(assembled)
+        for index, message in enumerate(cold):
+            message["_row_id"] = 100 + index
+        expected = 3
+        if change == "new_identical_turn":
+            cold.append({"role": "user", "content": messages[0]["content"], "_row_id": 200})
+            expected += 1
+        elif change == "edited":
+            cold[-1]["content"] = "edited prior answer"
+            expected += 1
+        profile = "foreign" if change == "other_scope" else "hermes"
+        replay = self._restart_engine(engine, tmp_path, profile=profile)
+        if change == "other_scope":
+            assert replay._reconcile_assembled_replay_cursor(cold) == 0
+            return
+        replay._ingest_messages(cold)
+        assert replay._store.get_session_count("assembly-session") == expected
+
+    @pytest.mark.parametrize("change", ["no_ids", "reversed_ids", "duplicate_ids", "unknown_bridge"])
+    def test_legacy_core_order_cannot_be_certified_without_ordered_occurrence_proof(self, tmp_path, monkeypatch, change):
+        engine, messages = self._legacy_interleaved_core_assembly(tmp_path, monkeypatch)
+        messages = copy.deepcopy(messages)
+        if change == "no_ids":
+            for message in messages:
+                message.pop("_row_id")
+        elif change == "reversed_ids":
+            messages[0]["_row_id"], messages[-1]["_row_id"] = messages[-1]["_row_id"], messages[0]["_row_id"]
+        elif change == "duplicate_ids":
+            messages[-1]["_row_id"] = messages[0]["_row_id"]
+        else:
+            messages[0]["_row_id"] = 1000
+        assembled = engine._assemble_context(None, messages)
+        assert not any("lcm_assembly_replay" in m.get("display_metadata", {}) for m in assembled)
+
+    @pytest.mark.parametrize("change", ["tampered_order", "signed_reversed_order", "signed_duplicate_source", "signed_mixed_schema", "source_changed"])
+    def test_legacy_core_order_receipts_keep_order_signature_and_source_guards(self, tmp_path, monkeypatch, change):
+        import hashlib
+        import hmac
+
+        engine, messages = self._legacy_interleaved_core_assembly(tmp_path, monkeypatch)
+        assembled = engine._assemble_context(None, messages)
+        assert engine._reconcile_assembled_replay_cursor(assembled) == len(assembled)
+        receipt = assembled[-1]["display_metadata"]["lcm_assembly_replay"]
+        if change == "source_changed":
+            engine._store.connection.execute("UPDATE messages SET content='changed source' WHERE store_id=?", (receipt["source_id"],))
+            engine._store.connection.commit()
+        else:
+            if change in {"tampered_order", "signed_reversed_order"}:
+                receipt["core_source_row_id"] = 1
+            elif change == "signed_duplicate_source":
+                first = assembled[-2]["display_metadata"]["lcm_assembly_replay"]
+                receipt["source_id"] = first["source_id"]
+                receipt["source_digest"] = first["source_digest"]
+            else:
+                receipt.pop("core_source_row_id")
+            if change != "tampered_order":
+                entry = {key: value for key, value in receipt.items() if key != "mac"}
+                receipt["mac"] = hmac.new(engine._assembly_replay_signing_key(), json.dumps(entry, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+        assert engine._reconcile_assembled_replay_cursor(assembled) < len(assembled)
+
+    @pytest.mark.parametrize("changed", [False, True])
+    def test_core_loader_projection_requires_exact_durable_output_proof(self, tmp_path, monkeypatch, changed):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=4000)
+        messages = [
+            {"role": "user", "content": "  carried request  ", "_row_id": 20},
+            {"role": "assistant", "content": "carried answer", "_row_id": 21},
+        ]
+        engine._ingest_messages(messages)
+        engine._dag.add_node(SummaryNode(session_id="assembly-session", summary="earlier summary", token_count=5,source_ids=[1],expand_hint="earlier details"))
+        loaded = copy.deepcopy(messages)
+        loaded[0]["content"] = "edited request" if changed else "carried request"
+        assembled = engine._assemble_context(None, loaded)
+        assert all("lcm_assembly_replay" in m.get("display_metadata", {}) for m in assembled) is not changed
+        if not changed:
+            for index,message in enumerate(assembled):
+                message["_row_id"] = 100 + index
+            replay = self._restart_engine(engine,tmp_path)
+            replay._ingest_messages(assembled)
+            assert replay._store.get_session_count("assembly-session") == 2
+
+    @pytest.mark.parametrize("change", ["again", "with_new_turn", "reordered_receipts"])
+    def test_legacy_core_order_receipts_survive_repeated_compaction(self, tmp_path, monkeypatch, change):
+        engine,messages = self._legacy_interleaved_core_assembly(tmp_path,monkeypatch)
+        cold = copy.deepcopy(engine._assemble_context(None,messages))
+        for index,message in enumerate(cold):
+            message["_row_id"] = 100 + index
+        replay = self._restart_engine(engine,tmp_path)
+        replay._ingest_messages(cold)
+        expected = 3
+        if change == "with_new_turn":
+            cold.append({"role":"user","content":messages[0]["content"],"_row_id":200})
+            replay._ingest_messages(cold)
+            expected += 1
+        tail = [m for m in cold if not replay._is_replayed_context_scaffold_message(m)]
+        if change == "reordered_receipts":
+            # Ascending fake Core labels cannot certify reordered receipts.
+            tail = list(reversed(tail))
+            for index,message in enumerate(tail):
+                message["_row_id"] = 300 + index
+        assembled = replay._assemble_context(None,tail)
+        if change == "reordered_receipts":
+            assert not all("lcm_assembly_replay" in m.get("display_metadata",{}) for m in assembled)
+            assert replay._reconcile_assembled_replay_cursor(assembled) != len(assembled)
+            return
+        assert replay._reconcile_assembled_replay_cursor(assembled) == len(assembled)
+        for index,message in enumerate(assembled):
+            message["_row_id"] = 300 + index
+        second = self._restart_engine(replay,tmp_path)
+        second._ingest_messages(assembled)
+        assert second._store.get_session_count("assembly-session") == expected
+
     def test_signed_source_ids_keep_identical_ingested_occurrences_distinct(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=160)
         messages = [
