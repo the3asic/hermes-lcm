@@ -21585,7 +21585,8 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=90)
 
-        assert result == [messages[0], messages[-1]]
+        # Reserve the actual user request before disposable assistant prose.
+        assert result == [messages[0], messages[1]]
         assert instance.compression_count == 1
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
