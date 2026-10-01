@@ -270,6 +270,111 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
+    def publication_snapshot(
+        self, source_ids: Sequence[int], source_type: str,
+        conversation_id: str = "",
+    ) -> dict[str, Any]:
+        """Read exact source rows and lifecycle ownership before model work."""
+        if source_type not in {"messages", "nodes"}:
+            raise ValueError("unsupported summary publication source type")
+        table, id_column = (
+            ("messages", "store_id") if source_type == "messages"
+            else ("summary_nodes", "node_id")
+        )
+        ids = tuple(sorted(set(source_ids)))
+        with self._db_lock:
+            rows = {}
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._conn.execute(
+                    f"SELECT * FROM {table} WHERE {id_column} IN ({placeholders})", batch,
+                ).fetchall():
+                    rows[row[0]] = tuple(row)
+            if len(rows) != len(ids):
+                raise RuntimeError("summary source disappeared before preparation")
+            parents = {source_id: [] for source_id in ids}
+            if ids:
+                sessions = tuple(sorted({row[1] for row in rows.values()}))
+                session_marks = ",".join("?" for _ in sessions)
+                for parent_id, parent_sources in self._conn.execute(
+                    "SELECT node_id, source_ids FROM summary_nodes WHERE source_type = ? "
+                    f"AND session_id IN ({session_marks}) ORDER BY node_id",
+                    (source_type, *sessions),
+                ).fetchall():
+                    for source_id in json.loads(parent_sources):
+                        if source_id in parents:
+                            parents[source_id].append(parent_id)
+                parents = {source_id: tuple(values) for source_id, values in parents.items()}
+            lifecycle = None
+            if conversation_id:
+                row = self._conn.execute(
+                    "SELECT current_session_id, current_frontier_store_id "
+                    "FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                lifecycle = tuple(row) if row is not None else None
+            return {"source_type": source_type, "rows": rows, "parents": parents,
+                    "conversation_id": conversation_id, "lifecycle": lifecycle}
+
+    def publish_node(
+        self, node: SummaryNode, snapshot: dict[str, Any], *,
+        frontier_store_id: int | None = None,
+        validate_runtime: Callable[[], None] | None = None,
+    ) -> int:
+        """Publish an unchanged source snapshot and frontier in one commit.
+
+        Model calls must complete before this method. The DAG owns this writer
+        connection and lock; source/frontier checks run under BEGIN IMMEDIATE.
+        Existing FTS and rollup-outbox triggers participate in the same commit.
+        """
+        with self._db_lock:
+            conn = self._conn
+            if conn is None or conn.in_transaction:
+                raise RuntimeError("summary publication requires an idle DAG writer")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if validate_runtime is not None:
+                    validate_runtime()
+                current = self.publication_snapshot(
+                    list(snapshot["rows"]), snapshot["source_type"], snapshot["conversation_id"],
+                )
+                if current != snapshot:
+                    raise RuntimeError("summary source or lifecycle changed during model work")
+                if any(source_id not in snapshot["rows"] for source_id in node.source_ids):
+                    raise RuntimeError("summary publication has uncaptured source IDs")
+                conversation_id = snapshot["conversation_id"]
+                if conversation_id and (
+                    snapshot["lifecycle"] is None or snapshot["lifecycle"][0] != node.session_id
+                ):
+                    raise RuntimeError("summary publication lost conversation ownership")
+                cur = conn.execute(
+                    """INSERT INTO summary_nodes
+                       (session_id, depth, summary, token_count, source_token_count,
+                        source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (node.session_id, node.depth, node.summary, node.token_count,
+                     node.source_token_count, json.dumps(node.source_ids), node.source_type,
+                     node.created_at or time.time(), node.earliest_at, node.latest_at, node.expand_hint),
+                )
+                if conversation_id and frontier_store_id is not None:
+                    updated = conn.execute(
+                        """UPDATE lcm_lifecycle_state
+                           SET current_frontier_store_id = MAX(current_frontier_store_id, ?), updated_at = ?
+                           WHERE conversation_id = ? AND current_session_id = ?""",
+                        (int(frontier_store_id), time.time(), conversation_id, node.session_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("summary publication lost frontier ownership")
+                if validate_runtime is not None:
+                    validate_runtime()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            node.node_id = cur.lastrowid
+            return node.node_id
+
     @staticmethod
     def stage_delete_session_scope(
         conn: sqlite3.Connection,
