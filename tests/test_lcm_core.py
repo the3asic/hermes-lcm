@@ -4802,16 +4802,12 @@ class TestAssemblyBudgetSelection:
         assert "KEEP_USER_DECISION" in contents
         assert "Latest compact status" in contents
         assert "oversized assistant tool chatter" not in contents
-        # The preserved objective is replayed as scaffolding (identified by its
-        # content prefix, not its role), so it must never appear as a raw
-        # user-role turn that could be re-ingested as a durable row.
-        assert not any(
-            msg.get("role") == "user"
-            and "[Current user objective preserved from compacted history]"
-            not in str(msg.get("content", ""))
-            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
-            for msg in assembled
-        )
+        # Budget selection keeps the live user's exact turn after evicting
+        # derived assistant chatter, without replacing it with scaffolding.
+        assert assembled.count({
+            "role": "user",
+            "content": "KEEP_USER_DECISION: continue with prompt-aware assembly.",
+        }) == 1
 
     def test_non_contiguous_raw_user_tail_replay_does_not_duplicate_durable_rows(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=160)
@@ -4827,10 +4823,10 @@ class TestAssemblyBudgetSelection:
         contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
         assert "repeat user intent" in contents
         assert "huge assistant output" not in contents
-        assert not any(
+        assert sum(
             msg.get("role") == "user" and msg.get("content") == "repeat user intent"
             for msg in assembled
-        )
+        ) == 1
 
         from hermes_lcm.engine import LCMEngine
 
@@ -4868,19 +4864,12 @@ class TestAssemblyBudgetSelection:
         ))
 
         assembled = engine._assemble_context(messages[0], messages[1:])
-        assert any(
-            "[Current user objective preserved from compacted history]" in str(msg.get("content", ""))
-            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+        assert sum(
+            msg.get("role") == "user" and msg.get("content") == messages[3]["content"]
             for msg in assembled
-        )
-        # The preserved objective is replayed as scaffolding (identified by its
-        # content prefix, not its role), so it must never appear as a raw
-        # user-role turn that could be re-ingested as a durable row.
+        ) == 1
         assert not any(
-            msg.get("role") == "user"
-            and "[Current user objective preserved from compacted history]"
-            not in str(msg.get("content", ""))
-            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            "oversized assistant tool chatter" in str(msg.get("content", ""))
             for msg in assembled
         )
 
@@ -4928,6 +4917,241 @@ class TestAssemblyBudgetSelection:
         assert len(rows) == len(persisted_messages) + 2
         assert [row["content"] for row in rows].count("repeat me") == 2
         assert rows[-1]["content"] == "new followup"
+
+    def _stored_non_contiguous_assembly(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=160)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "repeat user intent"},
+            {"role": "assistant", "content": "huge assistant output " * 400},
+        ]
+        engine._ingest_messages(messages)
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        assert assembled[-1]["display_metadata"]["lcm_assembly_replay"]["source_id"] == 2
+        return engine, messages, assembled
+
+    def _restart_engine(self, engine, tmp_path, *, session_id="assembly-session", profile="hermes"):
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / profile))
+        replay._session_id = session_id
+        replay._ingest_cursor_needs_reconcile = True
+        return replay
+
+    def test_signed_replay_keeps_a_new_identical_user_turn(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled + [{"role": "user", "content": original[1]["content"]}])
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 1
+        assert [row["content"] for row in rows].count(original[1]["content"]) == 2
+
+    @pytest.mark.parametrize("change", ["body", "role", "source_id", "mac", "ordinal", "reasoning"])
+    def test_edited_or_forged_receipt_does_not_suppress_a_delta(self, tmp_path, monkeypatch, change):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        edited = copy.deepcopy(assembled[-1])
+        receipt = edited["display_metadata"]["lcm_assembly_replay"]
+        if change == "body":
+            edited["content"] = "newly edited request"
+        elif change == "role":
+            edited["role"] = "assistant"
+        elif change == "reasoning":
+            edited["role"] = "assistant"
+            edited["reasoning_content"] = "a new real response"
+        elif change == "source_id":
+            receipt["source_id"] = 3
+        elif change == "mac":
+            receipt["mac"] = "0" * 64
+        else:
+            receipt["ordinal"] += 1
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages([edited])
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 1
+        assert rows[-1]["content"] == edited["content"]
+
+    @pytest.mark.parametrize("profile,session_id", [
+        ("other-profile", "assembly-session"), ("hermes", "other-session"),
+    ])
+    def test_receipt_cannot_suppress_rows_in_another_scope(self, tmp_path, monkeypatch, profile, session_id):
+        engine, _original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        replay = self._restart_engine(engine, tmp_path, profile=profile, session_id=session_id)
+        before = replay._store.get_session_count(session_id)
+        replay._ingest_messages([assembled[-1]])
+        assert replay._store.get_session_count(session_id) == before + 1
+
+    def test_changed_source_row_invalidates_its_receipt(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        engine._store._conn.execute("UPDATE messages SET content = ? WHERE store_id = 2", ("changed raw source",))
+        engine._store._conn.commit()
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages([assembled[-1]])
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 1
+        assert rows[-1]["content"] == original[1]["content"]
+
+    def test_duplicate_receipt_occurrence_does_not_erase_a_repeat(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        repeated = copy.deepcopy(assembled[-1])
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled + [repeated])
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 1
+        assert [row["content"] for row in rows].count(original[1]["content"]) == 2
+
+    def test_unpublished_new_assembly_keeps_the_old_core_snapshot_replayable(self, tmp_path, monkeypatch):
+        engine, original, old_core_snapshot = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        old_seed = engine._assembly_replay_signing_key()
+        candidate = engine._assemble_context(original[0], original[1:])
+        assert candidate[-1]["display_metadata"] != old_core_snapshot[-1]["display_metadata"]
+        assert engine._assembly_replay_signing_key() == old_seed
+        # The new candidate was never committed to Core state.db. A restart
+        # must still recognize the previous durable transcript's receipt.
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(copy.deepcopy(old_core_snapshot))
+        assert replay._store.get_session_count("assembly-session") == len(original)
+
+    def test_contiguous_reassembly_keeps_the_prior_source_receipt(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        reassembled = engine._assemble_context(assembled[0], assembled[1:], include_lcm_note=False)
+        assert reassembled[-1]["display_metadata"] == assembled[-1]["display_metadata"]
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(reassembled)
+        assert replay._store.get_session_count("assembly-session") == len(original)
+
+    def test_reused_tool_ids_sign_the_actual_raw_occurrence(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=240)
+        call = {"id": "reused", "type": "function", "function": {"name": "probe", "arguments": "{}"}}
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "first request"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "content": "same result", "tool_call_id": "reused"},
+            {"role": "user", "content": "second request"},
+            {"role": "assistant", "content": "huge assistant output " * 400},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "content": "same result", "tool_call_id": "reused"},
+        ]
+        engine._ingest_messages(messages)
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        sources = [
+            msg["display_metadata"]["lcm_assembly_replay"]["source_id"]
+            for msg in assembled if msg["role"] in {"assistant", "tool"}
+        ]
+        assert sources == [7, 8]
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled)
+        assert replay._store.get_session_count("assembly-session") == len(messages)
+
+    def test_signed_source_ids_keep_identical_ingested_occurrences_distinct(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=160)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "same user"},
+            {"role": "assistant", "content": "same answer"},
+            {"role": "user", "content": "same user"},
+            {"role": "assistant", "content": "same answer"},
+            {"role": "user", "content": "same user"},
+            {"role": "assistant", "content": "huge assistant output " * 400},
+        ]
+        engine._ingest_messages(messages)
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        live_user = next(msg for msg in assembled if msg.get("role") == "user")
+        assert live_user["display_metadata"]["lcm_assembly_replay"]["source_id"] == 6
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled)
+        assert replay._store.get_session_count("assembly-session") == len(messages)
+        # A raw detached copy has no structural occurrence proof; the ordered
+        # text mapper must not mint a trusted receipt from repeated content.
+        unknown_origin = self._restart_engine(engine, tmp_path)
+        detached = [{"role": msg["role"], "content": msg["content"]} for msg in messages[1:]]
+        uncertified = unknown_origin._assemble_context(messages[0], detached)
+        assert all("lcm_assembly_replay" not in msg.get("display_metadata", {}) for msg in uncertified)
+
+    def test_seed_initialization_is_shared_between_concurrent_store_connections(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch)
+        other = self._restart_engine(engine, tmp_path)
+        barrier = threading.Barrier(2)
+        keys = []
+        errors = []
+
+        def initialize(target):
+            try:
+                barrier.wait(timeout=5)
+                keys.append(target._assembly_replay_signing_key(create=True))
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=initialize, args=(target,)) for target in (engine, other)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+        assert not any(worker.is_alive() for worker in workers)
+        assert not errors
+        assert len(keys) == 2 and keys[0] is not None and keys[0] == keys[1]
+
+    def test_metadata_initialization_rolls_back_on_sql_failure(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch)
+        conn = engine._store._conn
+        conn.execute("""CREATE TEMP TRIGGER reject_receipt_seed BEFORE INSERT ON metadata
+                     BEGIN SELECT RAISE(ABORT, 'seed write failure'); END""")
+        with pytest.raises(sqlite3.IntegrityError, match="seed write failure"):
+            engine._store.read_or_create_metadata_json("failed-seed", '{}')
+        assert not conn.in_transaction
+        assert engine._store.read_metadata_json("failed-seed") is None
+        conn.execute("DROP TRIGGER reject_receipt_seed")
+        assert engine._store.read_or_create_metadata_json("failed-seed", '{"ok": true}') == {"ok": True}
+
+    def test_core_durable_delta_replays_once_and_same_time_new_occurrence_survives(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        same_time = 1780000000.0
+        first = {"role": "user", "content": "same new request", "timestamp": same_time, "_row_id": 101}
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled + [first])
+        assert replay._store.get_session_count("assembly-session") == len(original) + 1
+        second = {**first, "_row_id": 102}
+        restarted = self._restart_engine(engine, tmp_path)
+        restarted._ingest_messages(copy.deepcopy(assembled + [first, second]))
+        rows = restarted._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 2
+        assert [row["content"] for row in rows].count(first["content"]) == 2
+
+    def test_unpublished_core_delta_never_claims_an_identical_new_occurrence(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        first = {"role": "user", "content": "same new request"}
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled + [first])
+        restarted = self._restart_engine(engine, tmp_path)
+        restarted._ingest_messages(assembled + [dict(first)])
+        rows = restarted._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 2
+        assert [row["content"] for row in rows].count(first["content"]) == 2
+
+    def test_core_origin_bridge_failure_rolls_back_raw_append_too(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        replay = self._restart_engine(engine, tmp_path)
+
+        def fail_bridge(*args):
+            raise sqlite3.OperationalError("bridge publication failed")
+
+        monkeypatch.setattr(replay, "_publish_core_row_origins", fail_bridge)
+        with pytest.raises(sqlite3.OperationalError, match="bridge publication failed"):
+            replay._ingest_messages(assembled + [{"role": "user", "content": "new", "_row_id": 101}])
+        assert not replay._store._conn.in_transaction
+        assert replay._store.get_session_count("assembly-session") == len(original)
+
+    def test_changed_core_origin_content_preserves_the_edit(self, tmp_path, monkeypatch):
+        engine, original, assembled = self._stored_non_contiguous_assembly(tmp_path, monkeypatch)
+        first = {"role": "user", "content": "old request", "_row_id": 101}
+        replay = self._restart_engine(engine, tmp_path)
+        replay._ingest_messages(assembled + [first])
+        edited = {**first, "content": "edited request"}
+        restarted = self._restart_engine(engine, tmp_path)
+        restarted._ingest_messages(assembled + [edited])
+        rows = restarted._store.get_session_messages("assembly-session")
+        assert len(rows) == len(original) + 2
+        assert rows[-1]["content"] == "edited request"
 
     def test_assembly_skips_oversized_summary_and_keeps_later_fit_summary(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=140)

@@ -125,7 +125,7 @@ from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
-from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX, _ASSEMBLY_SOURCE_INDEX_KEY
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
@@ -605,6 +605,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
+        self._active_replay_store_origins: dict[int, tuple[Dict[str, Any], int, str]] = {}
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
@@ -2840,6 +2841,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # identity pass and can return stale active-message copies.
             self._last_active_replay_source_identities = []
             self._last_active_replay_messages = []
+            self._active_replay_store_origins = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             self._register_active_engine_binding()
             try:
@@ -4533,12 +4535,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_messages: List[Dict[str, Any]],
         active_replay_messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        self._last_active_replay_source_identities = [
-            self._message_replay_identity(message) for message in original_messages
-        ]
+        previous_origins = getattr(self, "_active_replay_store_origins", {})
+        previous_cached = getattr(self, "_last_active_replay_messages", [])
+        previous_identities = getattr(self, "_last_active_replay_source_identities", [])
+        current_identities = [self._message_replay_identity(message) for message in original_messages]
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
         )
+        origins = {}
+        prefix_matches = True
+        for index, (original, active, cached) in enumerate(zip(
+            original_messages, active_replay_messages, self._last_active_replay_messages,
+        )):
+            prefix_matches = (
+                prefix_matches and index < len(previous_identities)
+                and current_identities[index] == previous_identities[index]
+            )
+            candidates = [original, active]
+            if prefix_matches and index < len(previous_cached):
+                candidates.append(previous_cached[index])
+            origin = next((
+                previous_origins[id(candidate)] for candidate in candidates
+                if id(candidate) in previous_origins
+                and previous_origins[id(candidate)][0] is candidate
+                and previous_origins[id(candidate)][2] == self._session_id
+            ), None)
+            if origin is not None:
+                for message in (original, active, cached):
+                    origins[id(message)] = (message, origin[1], self._session_id)
+        self._active_replay_store_origins = origins
+        self._last_active_replay_source_identities = current_identities
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
         )
@@ -5124,13 +5150,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
+        stored_ids = self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
+            before_commit=lambda conn, ids: self._publish_core_row_origins(
+                conn, messages, messages_to_store_with_index, ids,
+            ),
         )
+        origins = getattr(self, "_active_replay_store_origins", {}).copy()
+        for (absolute_idx, _message), store_id in zip(messages_to_store_with_index, stored_ids):
+            for message in (messages[absolute_idx], active_replay_messages[absolute_idx]):
+                origins[id(message)] = (message, store_id, self._session_id)
+        self._active_replay_store_origins = origins
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
@@ -6337,6 +6371,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         result = []
         self._assembly_protected_group_dropped = False
+        assembly_source_messages = tail_messages
+        assembly_id = uuid.uuid4().hex
 
         # An assembly_cap_override is the forced-overflow-recovery signature:
         # every caller that passes one is rebuilding the context under
@@ -6353,6 +6389,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 _strip_replay_metadata_for_recovery_message(msg)
                 for msg in tail_messages
             ]
+
+        # Carry the original occurrence through cleanup/stubbing copies. This
+        # internal index is removed before returning, and never joins by text.
+        tagged_tail = []
+        for index, message in enumerate(tail_messages):
+            tagged = dict(message)
+            metadata = tagged.get("display_metadata")
+            if metadata is None or isinstance(metadata, dict):
+                tagged["display_metadata"] = {**(metadata or {}), _ASSEMBLY_SOURCE_INDEX_KEY: index}
+            tagged_tail.append(tagged)
+        tail_messages = tagged_tail
 
         # Leading anchor with optional LCM annotation. Only a true system prompt
         # is a safe permanent anchor; gateway sessions can start directly with
@@ -6497,7 +6544,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     trimmed_result.append(trimmed)
             result = self._sanitize_active_context_messages(trimmed_result)
 
-        return result
+        return self._remember_assembled_replay(
+            result, assembly_source_messages, assembly_id=assembly_id,
+        )
 
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:
         """Return whether an over-budget tail message may be evicted.
