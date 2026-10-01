@@ -80,7 +80,18 @@ def _ensure_engine_bound_to_session(
     conversation_id: str = "",
 ) -> None:
     session_id = str(session_id or "")
-    if session_id and _engine_bound_session_id(active_engine) != session_id:
+    needs_profile_rebind = False
+    if getattr(active_engine, "_config_from_env", False):
+        from .config import resolve_hermes_home
+
+        # A resolver failure must abort ingest, never retain a sibling binding.
+        needs_profile_rebind = (
+            Path(resolve_hermes_home()).expanduser().resolve()
+            != Path(str(getattr(active_engine, "_hermes_home", ""))).expanduser().resolve()
+        )
+    if session_id and (
+        _engine_bound_session_id(active_engine) != session_id or needs_profile_rebind
+    ):
         active_engine.on_session_start(
             session_id,
             platform=platform,
@@ -362,7 +373,6 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
 
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
-    from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
         LCM_GREP,
@@ -382,18 +392,9 @@ def register(ctx):
         LCM_DOCTOR,
     )
 
-    config = LCMConfig.from_env()
-
-    # Resolve hermes_home for profile-scoped storage
-    hermes_home = ""
-    try:
-        from hermes_cli.config import get_hermes_home
-        hermes_home = str(get_hermes_home())
-    except Exception:
-        import os
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-
-    engine = LCMEngine(config=config, hermes_home=hermes_home)
+    # Keep the registered prototype environment-backed: each routed agent must
+    # resolve its own config and storage instead of copying this home's snapshot.
+    engine = LCMEngine()
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
