@@ -162,7 +162,13 @@ def resolve_hermes_home() -> Path:
             from hermes_cli.config import get_hermes_home
         except ImportError:
             return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return Path(get_hermes_home())
+    try:
+        return Path(get_hermes_home())
+    except Exception as exc:
+        # Resolver errors can include private paths or credentials. Report the
+        # failure class, then preserve the fail-closed profile boundary.
+        logger.warning("LCM routed home resolver failed (%s); profile selection aborted", type(exc).__name__)
+        raise
 
 
 def _hermes_config_path() -> Path:

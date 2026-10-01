@@ -555,3 +555,15 @@ def test_routed_clone_does_not_inherit_sibling_live_compression_policy(routed_pl
         assert clone.threshold_tokens == 43000
     finally:
         host.active_home.reset(token)
+
+
+def test_home_resolver_failure_is_visible_without_logging_private_error_text(routed_plugin, monkeypatch, caplog):
+    host = routed_plugin
+    def broken():
+        raise RuntimeError("synthetic-secret-do-not-log")
+    monkeypatch.setattr(sys.modules["hermes_constants"], "get_hermes_home", broken)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError):
+            host.module.register(host.ctx)
+    assert "routed home resolver failed (RuntimeError)" in caplog.text
+    assert "synthetic-secret-do-not-log" not in caplog.text
