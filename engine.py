@@ -2628,6 +2628,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         )
         if same_binding_in_place_boundary:
+            # Older hosts send an end before the successful same-ID start.
+            # Keep the existing cursor while validating/restoring only that
+            # exact durable owner; ordinary bind_session can switch owners.
+            self._lifecycle.resume_compression_session(
+                self._conversation_id, session_id, self._last_compacted_store_id,
+            )
             # Hermes performs in-place compression by calling compress() and
             # then emitting a compression boundary with the same session id.
             # compress() has already rebased the cursor to its returned active
