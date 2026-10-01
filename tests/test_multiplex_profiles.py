@@ -453,3 +453,86 @@ def test_concurrent_profiles_with_identical_ids_keep_private_history(routed_plug
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(serve, name) for name in ("alpha", "beta")]
         assert [future.result(timeout=20) for future in futures] == [["alpha private"], ["beta private"]]
+
+
+def test_repeated_registration_keeps_one_dispatcher_and_releases_old_engines(routed_plugin):
+    import gc
+    import weakref
+    host = routed_plugin
+    external = lambda **kwargs: None
+    host.manager._hooks["post_llm_call"] = [external]
+    retired = []
+    for _ in range(100):
+        host.module.register(host.ctx)
+        if len(host.engines) > 1:
+            old = host.engines.pop(0)
+            retired.append(weakref.ref(old))
+            del old
+        assert host.manager._hooks["post_llm_call"][0] is external
+        assert len(host.manager._hooks["post_llm_call"]) == 2
+    gc.collect()
+    assert all(reference() is None for reference in retired)
+    engine = host.engines[0]
+    engine.on_session_start("one-turn")
+    ingests = []
+    engine.ingest = lambda history: ingests.append(history)
+    for hook in host.manager._hooks["post_llm_call"]:
+        hook(session_id="one-turn", conversation_history=[{"role": "user", "content": "once"}])
+    assert len(ingests) == 1
+
+
+def test_dispatcher_preserves_other_profiles_and_manager_namespaces(routed_plugin):
+    host = routed_plugin
+    prototypes = {}
+    for name in ("alpha", "beta"):
+        token = host.active_home.set(host.homes[name])
+        try:
+            host.module.register(host.ctx)
+            prototypes[name] = host.engines[-1]
+        finally:
+            host.active_home.reset(token)
+    assert len(host.manager._hooks["post_llm_call"]) == 1
+    for name in ("alpha", "beta"):
+        token = host.active_home.set(host.homes[name])
+        try:
+            host.manager._hooks["post_llm_call"][0](
+                session_id="same", conversation_history=[{"role": "user", "content": name}],
+            )
+            assert [r["content"] for r in prototypes[name]._store.get_session_messages("same")] == [name]
+        finally:
+            host.active_home.reset(token)
+    # An unknown routed home must never fall back to a sibling prototype.
+    host.manager._hooks["post_llm_call"][0](
+        session_id="unknown", conversation_history=[{"role": "user", "content": "unknown"}],
+    )
+    assert all(engine._store.get_session_messages("unknown") == [] for engine in prototypes.values())
+    other = lambda **kwargs: None
+    other._lcm_ingest_namespace = "other_plugin_namespace"
+    host.manager._hooks["post_llm_call"].append(other)
+    host.module.register(host.ctx)
+    assert other in host.manager._hooks["post_llm_call"]
+
+
+def test_legacy_dispatcher_is_retired_without_closing_live_sibling(routed_plugin):
+    host = routed_plugin
+    host.module.register(host.ctx)
+    engine = host.engines[-1]
+    # Recreate the prior generation's strong closure signature.
+    def factory(engine):
+        def _on_post_llm_call(**kwargs):
+            engine.ingest(kwargs.get("conversation_history", []))
+        return _on_post_llm_call
+    legacy = factory(engine)
+    legacy.__module__ = host.module.__name__
+    legacy.__qualname__ = "register.<locals>._on_post_llm_call"
+    host.manager._hooks["post_llm_call"][:] = [legacy]
+    token = host.active_home.set(host.homes["alpha"])
+    try:
+        host.module.register(host.ctx)
+    finally:
+        host.active_home.reset(token)
+    assert legacy not in host.manager._hooks["post_llm_call"]
+    host.manager._hooks["post_llm_call"][0](
+        session_id="legacy-live", conversation_history=[{"role": "user", "content": "kept"}],
+    )
+    assert engine._store.get_session_messages("legacy-live")[0]["content"] == "kept"
