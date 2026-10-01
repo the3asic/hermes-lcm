@@ -79,7 +79,8 @@ context:
   engine: lcm
 
 Verification:
-  1. Restart Hermes.
+  1. Restart Hermes through the controlled procedure if plugin/context-engine config or runtime code changed.
+     For docs/history-only updates with identical runtime files, keep Hermes running.
   2. Run: hermes plugins
   3. Confirm the plugin list includes hermes-lcm and the selected context engine is lcm.
   4. Confirm the available skills include hermes-lcm.
