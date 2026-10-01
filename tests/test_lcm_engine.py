@@ -21587,7 +21587,11 @@ class TestAssemblyGuardrails:
         result = instance.compress(messages, current_tokens=90)
 
         # Reserve the actual user request before disposable assistant prose.
-        assert result == [messages[0], messages[1]]
+        assert [
+            {key: value for key, value in msg.items() if key != "display_metadata"}
+            for msg in result
+        ] == [messages[0], messages[1]]
+        assert result[1]["display_metadata"]["lcm_assembly_replay"]["source_id"] == 2
         assert instance.compression_count == 1
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]

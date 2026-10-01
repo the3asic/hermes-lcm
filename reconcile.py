@@ -20,8 +20,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -48,6 +50,7 @@ from .ingest_protection import (
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
+from .engine_registry import _profile_registry_key
 
 import logging
 
@@ -57,9 +60,311 @@ _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from co
 _MAX_REPLAY_IDENTITY_CACHE_BYTES = 32 * 1024 * 1024
 _COMPACT_TOOL_REPLAY_IDENTITY_CHARS = 64 * 1024
 _COMPACT_TOOL_REPLAY_IDENTITY_PREFIX = "[LCM compact tool replay identity: "
+_ASSEMBLY_SOURCE_INDEX_KEY = "_lcm_assembly_source_index"
+_ASSEMBLY_REPLAY_KEY = "lcm_assembly_replay"
 
 
 class ReconcileMixin:
+    def _assembly_replay_signing_key(self, *, create: bool = False) -> bytes | None:
+        """Keep one stable session/profile key in the existing metadata table.
+
+        A new assembly cannot invalidate the previous Core transcript when its
+        publication fails. Receipts are self-contained, so no snapshot list or
+        retention window is needed. The signing key never enters a message.
+        """
+        if not self._session_id:
+            return None
+        key, scope = self._assembly_replay_state_scope()
+        try:
+            state = self._store.read_metadata_json(key)
+            if state is None and create:
+                state = self._store.read_or_create_metadata_json(
+                    key, json.dumps({**scope, "key": secrets.token_hex(32)}, sort_keys=True)
+                )
+            if not isinstance(state, dict) or any(state.get(k) != v for k, v in scope.items()):
+                return None
+            value = state.get("key")
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                return None
+            return bytes.fromhex(value)
+        except (ValueError, TypeError, OSError) as exc:
+            logger.debug("LCM assembly replay key unavailable: %s", exc)
+            return None
+
+    def _assembly_replay_state_scope(self) -> tuple[str, dict]:
+        scope = {
+            "version": 1, "profile": _profile_registry_key(self._hermes_home),
+            "session_id": self._session_id,
+            "core_db": str(self._state_db_path().resolve()),
+        }
+        key = "assembly_replay_key:" + hashlib.sha256(
+            json.dumps(scope, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return key, scope
+
+    def _validated_core_row_origins(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+        """Resolve Core's durable row IDs, never rendered content or timestamps."""
+        key, scope = self._assembly_replay_state_scope()
+        state = self._store.read_metadata_json(key)
+        if not isinstance(state, dict) or any(state.get(k) != v for k, v in scope.items()):
+            return {}
+        origins = state.get("origins", {})
+        if not isinstance(origins, dict):
+            return {}
+        mapped = {}
+        used_rows = set()
+        for message in messages:
+            row_id = message.get("_row_id")
+            if type(row_id) is not int or row_id <= 0 or row_id in used_rows:
+                continue
+            entry = origins.get(str(row_id))
+            if not isinstance(entry, dict):
+                continue
+            source_id = entry.get("source_id")
+            if type(source_id) is not int or source_id <= 0:
+                continue
+            row = self._store.get(source_id)
+            if (
+                not row or row.get("session_id") != self._session_id
+                or self._assembly_replay_digest(self._message_replay_identity(row, stored_row=True)) != entry.get("source_digest")
+                or self._assembly_replay_output_digest(message) not in entry.get("output_digests", [])
+            ):
+                continue
+            used_rows.add(row_id)
+            mapped[id(message)] = source_id
+        return mapped
+
+    def _publish_core_row_origins(self, conn, messages, indexed_messages, store_ids) -> None:
+        """Commit raw rows and their active Core-ID bridge in the same transaction."""
+        rows = [(index, msg) for index, msg in enumerate(messages) if type(msg.get("_row_id")) is int and msg["_row_id"] > 0]
+        if not rows:
+            return
+        key, scope = self._assembly_replay_state_scope()
+        raw = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        state = json.loads(raw[0]) if raw and raw[0] else {**scope, "key": secrets.token_hex(32)}
+        if not isinstance(state, dict) or any(state.get(k) != v for k, v in scope.items()):
+            raise ValueError("assembly replay scope does not match")
+        mapped = self._validated_core_row_origins(messages)
+        for (index, _msg), source_id in zip(indexed_messages, store_ids):
+            mapped[id(messages[index])] = source_id
+        live_origins = getattr(self, "_active_replay_store_origins", {})
+        origins = {}
+        for _index, message in rows:
+            source_id = mapped.get(id(message))
+            if source_id is None:
+                origin = live_origins.get(id(message))
+                if origin and origin[0] is message and origin[2] == self._session_id:
+                    source_id = origin[1]
+            if source_id is None:
+                continue
+            row = self._store.get(source_id)
+            if not row or row.get("session_id") != self._session_id:
+                continue
+            origins[str(message["_row_id"])] = {
+                "source_id": source_id,
+                "source_digest": self._assembly_replay_digest(self._message_replay_identity(row, stored_row=True)),
+                "output_digests": sorted({self._assembly_replay_output_digest(message), self._assembly_replay_output_digest(message, core_view=True)}),
+            }
+        # Retain only this active history's structured Core IDs. Receipt seed
+        # stays stable, so failed future assembly publication preserves replay.
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps({**state, "origins": origins}, sort_keys=True)),
+        )
+
+    @staticmethod
+    def _assembly_replay_digest(value: Any) -> str:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _assembly_replay_output_digest(self, message: Dict[str, Any], *, core_view: bool = False) -> str:
+        """Validate a receipt's projection; the join comes only from its signed ID.
+
+        Core adds timestamps/row IDs and stamps api_content after assembly. Its
+        persistence loader also sanitizes user/assistant text. These views are
+        registered at emission, while provider reasoning remains significant.
+        """
+        projected = dict(message)
+        content = projected.get("content")
+        if projected.get("role") == "user" and isinstance(content, str):
+            try:
+                from gateway.message_timestamps import strip_leading_message_timestamps
+            except ImportError:
+                pass
+            else:
+                content, _timestamp = strip_leading_message_timestamps(content)
+        if core_view and projected.get("role") in {"user", "assistant"} and isinstance(content, str):
+            try:
+                from agent.memory_manager import sanitize_context
+            except ImportError:
+                pass
+            else:
+                content = sanitize_context(content)
+            content = content.strip()
+        projected["content"] = content
+        reasoning = {}
+        if projected.get("role") == "assistant":
+            for key in (
+                "reasoning", "reasoning_content", "reasoning_details",
+                "codex_reasoning_items", "codex_message_items", "finish_reason",
+            ):
+                value = projected.get(key)
+                if value is not None and (value or key == "reasoning_content"):
+                    reasoning[key] = value
+        return self._assembly_replay_digest([self._message_replay_identity(projected), reasoning])
+
+    def _remember_assembled_replay(
+        self, result: List[Dict[str, Any]], source_messages: List[Dict[str, Any]], *, assembly_id: str,
+        sign_projection: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Sign a non-contiguous assembly using its original structured source map."""
+        cleaned = []
+        source_indices = []
+        for message in result:
+            copied = dict(message)
+            metadata = copied.get("display_metadata")
+            source_index = None
+            if isinstance(metadata, dict):
+                metadata = dict(metadata)
+                source_index = metadata.pop(_ASSEMBLY_SOURCE_INDEX_KEY, None)
+                if metadata:
+                    copied["display_metadata"] = metadata
+                else:
+                    copied.pop("display_metadata", None)
+            cleaned.append(copied)
+            if (
+                type(source_index) is int
+                and self._is_replayed_context_scaffold_message(source_messages[source_index])
+            ):
+                source_index = None
+            source_indices.append(source_index)
+        selected = [index for index in source_indices if type(index) is int]
+        if not sign_projection or not selected or selected == list(range(min(selected), len(source_messages))):
+            return cleaned
+        # Never certify an unknown raw occurrence or let the receipt change a
+        # host-owned non-dictionary display value.
+        if any("display_metadata" in msg and not isinstance(msg["display_metadata"], dict) for msg in cleaned):
+            return cleaned
+        origins = getattr(self, "_active_replay_store_origins", {})
+        ids_by_message_id = {
+            id(msg): origins[id(msg)][1] for msg in source_messages
+            if id(msg) in origins and origins[id(msg)][0] is msg
+            and origins[id(msg)][2] == self._session_id
+        }
+        ids_by_message_id.update(self._validated_core_row_origins(source_messages))
+        for index in selected:
+            source = source_messages[index]
+            metadata = source.get("display_metadata")
+            receipt = metadata.get(_ASSEMBLY_REPLAY_KEY) if isinstance(metadata, dict) else None
+            if isinstance(receipt, dict) and self._reconcile_assembled_replay_cursor([source]) == 1:
+                if receipt.get("source_id") is not None:
+                    ids_by_message_id[id(source)] = receipt["source_id"]
+        if any(id(source_messages[index]) not in ids_by_message_id for index in selected):
+            unique_ids = self._get_store_id_map_for_messages(source_messages, require_unique=True)
+            for message_id, source_id in unique_ids.items():
+                ids_by_message_id.setdefault(message_id, source_id)
+        entries = []
+        last_store_id = 0
+        for message, source_index in zip(cleaned, source_indices):
+            source_id = None
+            source_digest = None
+            if type(source_index) is int:
+                source_id = ids_by_message_id.get(id(source_messages[source_index]))
+                if type(source_id) is not int or source_id <= last_store_id:
+                    return cleaned
+                row = self._store.get(source_id)
+                if not row or row.get("session_id") != self._session_id:
+                    return cleaned
+                row_identity = self._message_replay_identity(row, stored_row=True)
+                source_identity = self._message_replay_identity(source_messages[source_index])
+                if source_identity != row_identity:
+                    return cleaned
+                source_digest = self._assembly_replay_digest(row_identity)
+                last_store_id = source_id
+            entries.append({
+                "assembly_id": assembly_id,
+                "ordinal": len(entries),
+                "source_id": source_id,
+                "source_digest": source_digest,
+                "output_digests": sorted({
+                    self._assembly_replay_output_digest(message),
+                    self._assembly_replay_output_digest(message, core_view=True),
+                }),
+            })
+        signing_key = self._assembly_replay_signing_key(create=True)
+        if signing_key is None:
+            return cleaned
+        for message, entry in zip(cleaned, entries):
+            mac = hmac.new(signing_key, json.dumps(entry, sort_keys=True).encode("utf-8"), hashlib.sha256).hexdigest()
+            message["display_metadata"] = {
+                **message.get("display_metadata", {}), _ASSEMBLY_REPLAY_KEY: {**entry, "mac": mac},
+            }
+        return cleaned
+
+    def _reconcile_assembled_replay_cursor(self, messages: List[Dict[str, Any]]) -> int | None:
+        """Accept only signed, ordered occurrences whose exact source rows remain."""
+        receipts = [
+            msg.get("display_metadata", {}).get(_ASSEMBLY_REPLAY_KEY)
+            if isinstance(msg.get("display_metadata"), dict) else None
+            for msg in messages
+        ]
+        core_origins = self._validated_core_row_origins(messages)
+        if not any(receipt is not None for receipt in receipts) and not core_origins:
+            return None
+        signing_key = self._assembly_replay_signing_key()
+        if signing_key is None:
+            return 0
+        assembly_id = None
+        last_ordinal = -1
+        last_store_id = 0
+        cursor = 0
+        for message, receipt in zip(messages, receipts):
+            if receipt is None and id(message) in core_origins:
+                source_id = core_origins[id(message)]
+                if source_id <= last_store_id:
+                    break
+                last_store_id = source_id
+                cursor += 1
+                continue
+            if not isinstance(receipt, dict) or set(receipt) != {
+                "assembly_id", "ordinal", "source_id", "source_digest", "output_digests", "mac",
+            }:
+                break
+            ordinal = receipt.get("ordinal")
+            source_id = receipt.get("source_id")
+            digests = receipt.get("output_digests")
+            nonce = receipt.get("assembly_id")
+            if (
+                type(ordinal) is not int or ordinal <= last_ordinal
+                or not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+                or (assembly_id is not None and nonce != assembly_id)
+                or not isinstance(digests, list) or not 1 <= len(digests) <= 2
+                or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests)
+                or (source_id is not None and (type(source_id) is not int or source_id <= last_store_id))
+            ):
+                break
+            entry = {key: value for key, value in receipt.items() if key != "mac"}
+            expected = hmac.new(signing_key, json.dumps(entry, sort_keys=True).encode("utf-8"), hashlib.sha256).hexdigest()
+            mac = receipt.get("mac")
+            if not isinstance(mac, str) or not hmac.compare_digest(mac, expected):
+                break
+            if self._assembly_replay_output_digest(message) not in digests:
+                break
+            if source_id is not None:
+                row = self._store.get(source_id)
+                if (
+                    not row or row.get("session_id") != self._session_id
+                    or self._assembly_replay_digest(self._message_replay_identity(row, stored_row=True)) != receipt["source_digest"]
+                ):
+                    break
+                last_store_id = source_id
+            elif receipt.get("source_digest") is not None:
+                break
+            assembly_id = nonce
+            last_ordinal = ordinal
+            cursor += 1
+        return cursor
+
     def _replay_operation_local_state(self) -> threading.local:
         local = getattr(self, "_replay_operation_local", None)
         if local is None:
@@ -1043,6 +1348,18 @@ class ReconcileMixin:
                     return cursor
             return 0
 
+        assembly_cursor = self._reconcile_assembled_replay_cursor(messages)
+        if assembly_cursor is not None:
+            self._record_ingest_reconciliation(
+                action="advanced cursor" if assembly_cursor else "preserved delta",
+                reason="validated assembled source receipts" if assembly_cursor else "unproved assembly receipts",
+                cursor=assembly_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=0,
+            )
+            return assembly_cursor
+
         tail_limit = min(max(len(messages) * 4, 64), session_count)
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
@@ -1151,13 +1468,16 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
-    def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+    def _get_store_id_map_for_messages(
+        self, messages: List[Dict[str, Any]], *, require_unique: bool = False,
+    ) -> dict[int, int]:
         with self._replay_identity_operation():
-            return self._get_store_id_map_for_messages_uncached(messages)
+            return self._get_store_id_map_for_messages_uncached(messages, require_unique=require_unique)
 
     def _get_store_id_map_for_messages_uncached(
         self,
         messages: List[Dict[str, Any]],
+        *, require_unique: bool = False,
     ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
@@ -1376,4 +1696,11 @@ class ReconcileMixin:
                 ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                 store_idx = match_idx + 1
 
+        if require_unique:
+            return {
+                id(msg): ids_by_message_id[id(msg)] for msg in messages
+                if id(msg) in ids_by_message_id
+                and active_identity_counts.get(self._message_replay_identity(msg), 0) == 1
+                and stored_identity_counts.get(self._message_replay_identity(msg), 0) == 1
+            }
         return ids_by_message_id

@@ -522,7 +522,8 @@ class MessageStore:
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                before_commit: "Callable[[sqlite3.Connection, List[int]], None] | None" = None) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -564,6 +565,8 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+            if before_commit is not None:
+                before_commit(self._conn, ids)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
@@ -1129,6 +1132,19 @@ class MessageStore:
             if wrote:
                 conn.commit()
         return wrote
+
+    def read_or_create_metadata_json(self, key: str, serialized: str) -> Any:
+        """Atomically initialize one metadata value without replacing a peer's value."""
+        conn = self._conn
+        if conn is None:
+            return None
+        with self._write_lock, conn:
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
+                (key, serialized),
+            )
+            row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        return json.loads(str(row[0])) if row and row[0] else None
 
     # -- Compaction telemetry ------------------------------------------------
 
