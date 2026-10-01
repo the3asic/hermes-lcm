@@ -1640,7 +1640,7 @@ def test_ingest_externalizes_unicode_escaped_slash_duplicate_key_tool_argument(t
 
     for label, slash_escape in (("lower", "\\u002f"), ("upper", "\\u002F")):
         variant_path = tmp_path / label
-        variant_path.mkdir()
+        variant_path.mkdir(mode=0o700)
         engine = _engine(variant_path)
         escaped_data_uri = "data:image" + slash_escape + "png;base64," + medium_payload
         original_arguments = f'{{"image":"{escaped_data_uri}","image":"plain"}}'
@@ -4222,3 +4222,21 @@ def test_wrapped_base64_scan_preserves_short_terminal_line():
     payload = "\n".join([full_line] * 70 + [terminal])
 
     assert contains_long_base64_run(payload) is True
+
+
+def test_private_key_scanner_bypasses_regex_on_pathological_input(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+    def forbidden(name):
+        raise AssertionError("private-key redaction must not enter the timeout regex")
+    monkeypatch.setattr(ip, "_regex_pattern_for", forbidden)
+    engine = _sensitive_engine(tmp_path)
+    noise = ("-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "\n") * 20000
+    body = "synthetic-private-key-material-123456789"
+    key = "-----BEGIN RSA PRIVATE KEY-----\n" + body + "\n-----END RSA PRIVATE KEY-----"
+    try:
+        result = redact_sensitive_text(noise + key + noise, engine._config)
+        assert body not in result
+        assert "-----END RSA PRIVATE KEY-----" not in result
+        assert "[LCM sensitive redaction:" in result
+    finally:
+        engine.shutdown()
