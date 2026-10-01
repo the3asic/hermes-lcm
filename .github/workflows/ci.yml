@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "abm/native-portability-*"]
   pull_request:
     branches: [main]
 
@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   workflow-lint:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -23,6 +24,7 @@ jobs:
           "$(go env GOPATH)"/bin/actionlint
 
   lint:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -39,6 +41,7 @@ jobs:
         run: ruff check .
 
   test:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -96,3 +99,27 @@ jobs:
           python -m py_compile scripts/import_lossless_claw.py
           bash -n scripts/install.sh scripts/update.sh
           git diff --check
+
+  test-macos-paths:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/abm/native-portability-macos-')
+    runs-on: macos-latest
+    timeout-minutes: 10
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install pytest numpy PyYAML tiktoken
+      - name: Verify native macOS path containment
+        run: python -m pytest tests/test_path_containment.py tests/test_path_security.py -q -p no:cacheprovider --junitxml=native-macos.xml
+      - name: Upload native test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-macos-path-results
+          path: native-macos.xml
+          if-no-files-found: error

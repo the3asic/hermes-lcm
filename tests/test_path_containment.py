@@ -22,7 +22,7 @@ def test_path_containment_within_allowed_base(monkeypatch):
         # Should succeed without raising
         path = _state_db_path_for_engine(engine)
         assert path.is_absolute()
-        assert str(path).startswith(tmpdir)
+        assert path.is_relative_to(Path(tmpdir).resolve())
 
 
 def test_path_containment_outside_allowed_base(monkeypatch):
@@ -153,3 +153,19 @@ def test_externalization_path_strict_containment_when_base_set(monkeypatch, tmp_
         get_large_output_storage_dir(
             Config(), hermes_home=str(tmp_path / "allowed" / "hermes"), create=False
         )
+
+
+def test_symlink_base_resolves_without_accepting_similar_prefix(tmp_path, monkeypatch):
+    from hermes_lcm.command import _state_db_path_for_engine
+    base = tmp_path / "allowed"
+    base.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(base, target_is_directory=True)
+    monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(alias))
+    class Engine:
+        _hermes_home = str(alias / "profile")
+    path = _state_db_path_for_engine(Engine())
+    assert path.is_relative_to(base.resolve())
+    Engine._hermes_home = str(tmp_path / "allowed-other")
+    with pytest.raises(ValueError, match="not within allowed base"):
+        _state_db_path_for_engine(Engine())
