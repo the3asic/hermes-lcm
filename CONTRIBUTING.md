@@ -33,7 +33,15 @@ upstream `main`. Before deployment, inspect the actual production checkout and
 runtime, preserve a known rollback commit and verified recovery material, and
 deploy the exact reviewed merge commit through the existing controlled procedure.
 Normal rollback changes code only, retaining the live databases and newer
-messages; an older backup must not replace live chat history.
+messages; never automatically replace live history with an older backup.
+For a documented downgrade that cannot open the newer database safely, do not
+start incompatible code on the live file. Preserve verified, consistent snapshots
+of the current database and its newer history and payloads first. Restore the
+pre-upgrade backup into a separate offline candidate, verify its integrity and
+compatibility, and define how newer history will remain available. Any production
+database replacement or loss of active history needs separate explicit approval;
+a routine code rollback does not authorize it. See the
+[version-specific upgrade and recovery guidance](docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1).
 
 This policy uses the existing tests, release workflow, and deployment process;
 it adds no services, dependencies, or automatic deployment.
