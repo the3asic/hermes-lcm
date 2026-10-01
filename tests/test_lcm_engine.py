@@ -21444,9 +21444,10 @@ class TestAssemblyGuardrails:
             ],
         )
 
-        contents = [msg["content"] for msg in result[1:]]
-        assert any("a" * 20 in content for content in contents)
-        assert not any(msg.get("role") == "user" and msg.get("content") == "a" * 20 for msg in result[1:])
+        # Reserve the real request before oversized assistant prose. A generated
+        # objective scaffold is not a substitute when the original user fits.
+        assert sum(msg.get("role") == "user" and msg.get("content") == "a" * 20 for msg in result[1:]) == 1
+        assert not any(msg.get("content") == "b" * 140 for msg in result[1:])
 
     def test_context_anchor_is_budgeted_under_max_assembly_tokens(self, tmp_path, monkeypatch):
         import importlib
