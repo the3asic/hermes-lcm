@@ -361,6 +361,36 @@ _AUTO_FOCUS_MAX_CHARS = 700
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
+# Canonical provider-visible message keys. Overflow recovery rebuilds the
+# active context from these only; every other key on an incoming message is
+# transport-replayed provider metadata (``reasoning``, ``codex_reasoning_items``,
+# ``codex_message_items``, ...) that count_message_tokens deliberately does
+# not model — keeping it would break the recovery cap in the provider-visible
+# payload (PR #533 review).
+_RECOVERY_CANONICAL_MESSAGE_KEYS = (
+    "role",
+    "name",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+)
+
+
+def _strip_replay_metadata_for_recovery_message(
+    message: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of *message* keeping only canonical provider keys.
+
+    Non-dict input passes through untouched (defensive, matches the
+    tolerance of the message estimator). Messages that already carry only
+    canonical keys are returned as-is — no copy, no mutation.
+    """
+    if not isinstance(message, dict):
+        return message
+    if not (set(message) - set(_RECOVERY_CANONICAL_MESSAGE_KEYS)):
+        return message
+    return {key: message[key] for key in _RECOVERY_CANONICAL_MESSAGE_KEYS if key in message}
+
 
 def _normalize_total_compactions(value: Any) -> int:
     """Return a persisted compaction total only when it is a valid counter."""
@@ -463,6 +493,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        # Reconciliation may run concurrently for separate gateway requests.
+        # Initialize thread-local operation caches eagerly so first-use races
+        # cannot replace another thread's local container.
+        self._replay_operation_local = threading.local()
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -549,6 +583,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        self._last_compression_made_progress = False
+        self._verify_compaction_cleared_threshold = False
+        self.awaiting_real_usage_after_compression = False
         # Ingest-failure tracking. The core promise is that nothing is ever
         # lost, but a swallowed persistence error (disk full, DB locked,
         # corruption) silently breaks it: the turn continues while messages
@@ -1158,6 +1195,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     if generation_matches:
                         self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
             return
+        # Hermes reads this flag before this call to verify a committed change.
+        # Consume it once, including when this response has no token count.
+        self._verify_compaction_cleared_threshold = False
+        # The host's post-tool gate must not keep waiting after this response.
+        # Auxiliary usage above belongs to another request and cannot clear it.
+        self.awaiting_real_usage_after_compression = False
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
@@ -1713,6 +1756,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     timeout=timeout_seconds,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
+                    large_source_summary_min_source_tokens=(
+                        self._config.large_source_summary_min_source_tokens
+                    ),
+                    large_source_summary_min_result_tokens=(
+                        self._config.large_source_summary_min_result_tokens
+                    ),
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
                     source_provenance={
@@ -2610,6 +2659,85 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
         self._lcm_current_start_allows_bypass_lineage = False
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
+        same_binding_in_place_boundary = bool(
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id == session_id
+            and previous_session_id == session_id
+            and kwargs.get("in_place") is not False
+            and (
+                not requested_platform
+                or not self._session_platform
+                or requested_platform == self._session_platform
+            )
+            and (
+                not requested_conversation_id
+                or not self._conversation_id
+                or requested_conversation_id == self._conversation_id
+            )
+        )
+        if same_binding_in_place_boundary:
+            # Hermes performs in-place compression by calling compress() and
+            # then emitting a compression boundary with the same session id.
+            # compress() has already rebased the cursor to its returned active
+            # context. Treating this callback as a fresh session start clears
+            # that cursor, schedules a full durable replay reconciliation, and
+            # can append the entire active history again.
+            active_message_count = kwargs.get("active_message_count")
+            if (
+                isinstance(active_message_count, int)
+                and not isinstance(active_message_count, bool)
+                and active_message_count >= 0
+            ):
+                self._ingest_cursor = active_message_count
+            elif active_message_count is not None:
+                logger.warning(
+                    "LCM ignored invalid in-place compression active_message_count=%r for session=%s",
+                    active_message_count,
+                    session_id,
+                )
+            metadata_kwargs = dict(kwargs)
+            metadata_kwargs.setdefault("platform", self._session_platform)
+            self._apply_session_start_metadata(session_id, metadata_kwargs)
+            self._ingest_cursor_needs_reconcile = False
+            self._clear_pending_reset_boundary()
+            self._compression_boundary_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
+            # These cache entries describe the pre-boundary list. Reusing them
+            # against the compressed list would force another expensive replay
+            # identity pass and can return stale active-message copies.
+            self._last_active_replay_source_identities = []
+            self._last_active_replay_messages = []
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._register_active_engine_binding()
+            try:
+                session_count = self._store.get_session_count(session_id)
+            except Exception:
+                session_count = -1
+                logger.debug(
+                    "LCM in-place compression boundary count probe failed: session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            self._last_ingest_reconciliation = {
+                "action": "preserved cursor",
+                "reason": "same-session in-place compression boundary",
+                "cursor": self._ingest_cursor,
+                "incoming": self._ingest_cursor,
+                "session_count": session_count,
+                "stored_tail_count": 0,
+            }
+            logger.info(
+                "LCM preserved in-place compression boundary: session=%s cursor=%d frontier=%d",
+                session_id,
+                self._ingest_cursor,
+                self._last_compacted_store_id,
+            )
+            self._log_session_filter_diagnostics()
+            return
         pre_reset_preserve_ambiguous_no_frame_old_session = False
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
             old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
@@ -4852,16 +4980,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages_to_store_with_index,
             protected_messages,
         ):
-            if self._protected_message_uses_raw_payload_active_stub(protected_msg):
-                if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
-                    )
-                active_message = dict(active_replay_messages[absolute_idx])
-                active_message["content"] = protected_msg["content"]
-                active_replay_messages[absolute_idx] = active_message
-                continue
-
             active_message = active_replay_messages[absolute_idx]
             stubbed_message = self._maybe_stub_active_tool_result(
                 active_message,
@@ -4894,18 +5012,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-        # Most ``protected_messages`` changes are storage-only: inline media and
-        # data/base64 substrings stay provider-usable in active replay. The
-        # exceptions are whole-message ``raw_payload`` externalization and the
-        # separately opt-in textual tool-result interceptor above.
+        # ``protected_messages`` is the durable-store view only: inline media,
+        # data/base64 substrings, and generic whole-message ``raw_payload``
+        # externalization must not shrink provider-visible active context before
+        # the configured compression threshold. The separately opt-in textual
+        # tool-result interceptor above remains an active-replay policy.
         return self._remember_active_replay_messages(messages, active_replay_messages)
-
-    @staticmethod
-    def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
-        content = message.get("content")
-        return isinstance(content, str) and content.startswith(
-            "[Externalized payload: kind=raw_payload;"
-        )
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
@@ -5655,6 +5767,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             timeout=timeout_seconds,
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
+            large_source_summary_min_source_tokens=(
+                self._config.large_source_summary_min_source_tokens
+            ),
+            large_source_summary_min_result_tokens=(
+                self._config.large_source_summary_min_result_tokens
+            ),
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
             source_provenance={
@@ -5839,8 +5957,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         emitted inside the summary block so restart reconciliation ignores it
         instead of ingesting a duplicate non-contiguous user message.
 
-        Previous preserved-objective scaffolds are derived context, not real
-        user turns, so they are not eligible as the next anchor source. Once a
+        Previous objective anchors and DAG summaries are derived context, not
+        real user turns, so they are not eligible as the next anchor source. Once a
         reverse scan reaches one, older user turns are stale relative to that
         synthetic continuity marker and must not be promoted as current intent.
         """
@@ -5859,7 +5977,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 or self._is_ignored_active_replay_placeholder(message, content_text)
             ):
                 continue
-            if self._preserved_objective_context_content(message):
+            # Provider-compatible role=user does not make a generated summary
+            # direct user guidance. Treat it as the same continuity boundary.
+            if self._is_replayed_context_scaffold_message(message):
                 return None
             if message.get("role") != "user":
                 continue
@@ -6022,6 +6142,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           [fresh tail messages]
         """
         result = []
+
+        # An assembly_cap_override is the forced-overflow-recovery signature:
+        # every caller that passes one is rebuilding the context under
+        # recovery pressure. Project the inputs onto canonical message keys
+        # here so the recovery guarantee holds no matter which entry point
+        # (_assemble_overflow_recovery_context, the post-leaf-compaction
+        # assembly in compaction.py) reached this method — replay metadata
+        # that count_message_tokens does not model must not survive into a
+        # payload assembled against the cap. Normal (override-less) assembly
+        # never strips: replay fields are the host's business there.
+        if assembly_cap_override is not None:
+            system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
+            tail_messages = [
+                _strip_replay_metadata_for_recovery_message(msg)
+                for msg in tail_messages
+            ]
 
         # Leading anchor with optional LCM annotation. Only a true system prompt
         # is a safe permanent anchor; gateway sessions can start directly with
@@ -6275,15 +6411,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         observed_tokens: Optional[int] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[int]:
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is None:
-            return None
-        if messages is None or observed_tokens is None or observed_tokens <= 0:
-            return assembly_cap
+        """Return the cap used while rebuilding the provider-visible context.
 
-        message_tokens = count_messages_tokens(messages)
-        overhead_tokens = max(0, observed_tokens - message_tokens)
-        return max(1, assembly_cap - overhead_tokens)
+        ``observed_tokens`` is a pressure signal from the host.  It is not a
+        message-only count: Hermes may include system prompts, tool schemas,
+        and provider replay metadata that LCM's message estimator deliberately
+        does not model.  Subtracting ``observed_tokens - message_tokens``
+        therefore treats estimator skew as fixed assembly overhead and can
+        collapse a normal cap to one token.  Headroom for non-message payloads
+        belongs in ``reserve_tokens_floor`` (or an explicit cap), so recovery
+        must use the configured message-assembly cap unchanged.
+        """
+        assembly_cap = self._effective_assembly_token_cap()
+        return assembly_cap
 
     def _effective_assembly_token_cap(self) -> Optional[int]:
         """Return the active assembly cap, if any.
@@ -6321,6 +6461,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        # Recovery rebuilds the provider-visible payload from canonical
+        # message parts only. Transports replay provider metadata such as
+        # ``reasoning`` / ``codex_reasoning_items`` / ``codex_message_items``
+        # alongside each message; count_message_tokens does not count them,
+        # so retaining them would let a recovered context that measured at
+        # the cap ship a payload far past it and re-overflow on the next
+        # request. Copies, never mutates the caller's dicts.
+        system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
+        tail_messages = [
+            _strip_replay_metadata_for_recovery_message(msg) for msg in tail_messages
+        ]
         if tail_messages:
             first = tail_messages[0]
             content = first.get("content") or ""

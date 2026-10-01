@@ -136,6 +136,20 @@ class TestModelRouting:
         assert route.provider == "my-provider"
         assert route.model == "model-a"
 
+    def test_minimax_cn_builtin_provider_prefix_is_split(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            registry={"minimax-cn": object()},
+        )
+
+        route = parse_lcm_model_override("minimax-cn/MiniMax-M3")
+
+        assert route.provider == "minimax-cn"
+        assert route.model == "MiniMax-M3"
+        assert route.api_mode == "anthropic_messages"
+
     def test_custom_prefixed_named_provider_is_split_when_provider_resolves(self, monkeypatch):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
@@ -149,6 +163,26 @@ class TestModelRouting:
 
         assert route.provider == "lcpp"
         assert route.model == "4B-Qwen3-2507-compressor"
+
+    def test_custom_prefixed_named_provider_carries_entry_api_mode(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={
+                "zhipu-shim": {
+                    "base_url": "http://127.0.0.1:53744/api/anthropic",
+                    "api_mode": "anthropic_messages",
+                }
+            },
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("custom:zhipu-shim/glm-5.2")
+
+        assert route.provider == "zhipu-shim"
+        assert route.model == "glm-5.2"
+        assert route.api_mode == "anthropic_messages"
 
     def test_openrouter_organization_slug_stays_model_only(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
@@ -200,7 +234,7 @@ class TestProviderPrefixedAuxiliaryCalls:
         runtime_provider._get_named_custom_provider = fake_get_named_custom_provider
 
         auth = ModuleType("hermes_cli.auth")
-        auth.PROVIDER_REGISTRY = {}
+        auth.PROVIDER_REGISTRY = {"minimax-cn": object()}
 
         hermes_cli.runtime_provider = runtime_provider
         hermes_cli.auth = auth
@@ -225,6 +259,25 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert result == "summary"
         assert seen["provider"] == "cerebras"
         assert seen["model"] == "gpt-oss-120b"
+
+    def test_summary_call_passes_minimax_cn_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
+
+        result = _call_llm_for_summary("summarize", 200, model="minimax-cn/MiniMax-M3")
+
+        assert result == "summary"
+        assert seen["provider"] == "minimax-cn"
+        assert seen["model"] == "MiniMax-M3"
+        assert seen["api_mode"] == "anthropic_messages"
 
     def test_summary_l1_and_l2_keep_adversarial_source_but_strip_private_session_provenance(
         self,
@@ -396,6 +449,48 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["provider"] == "lcpp"
         assert seen["model"] == "4B-Qwen3-2507-compressor"
 
+    def test_summary_call_passes_custom_prefixed_provider_api_mode(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+        runtime_provider._get_named_custom_provider = (
+            lambda provider: {
+                "name": "zhipu-shim",
+                "base_url": "http://127.0.0.1:53744/api/anthropic",
+                "api_mode": "anthropic_messages",
+            }
+            if provider == "zhipu-shim"
+            else None
+        )
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = {}
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
+        result = _call_llm_for_summary(
+            "summarize",
+            200,
+            model="custom:zhipu-shim/glm-5.2",
+        )
+
+        assert result == "summary"
+        assert seen["provider"] == "zhipu-shim"
+        assert seen["model"] == "glm-5.2"
+        assert seen["api_mode"] == "anthropic_messages"
+
     def test_summary_fallback_chain_uses_next_model_after_primary_failure(self, monkeypatch):
         from hermes_lcm import escalation
 
@@ -476,6 +571,62 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert level == 1
         assert calls == ["primary-model", "fallback-model"]
 
+    def test_large_source_rejects_tiny_llm_summary_and_uses_fallback(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return "tiny"
+            return "fallback detail " * 80
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 8000,
+            source_tokens=100_000,
+            token_budget=4_000,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            large_source_summary_min_source_tokens=100_000,
+            large_source_summary_min_result_tokens=50,
+        )
+
+        assert summary == "fallback detail " * 80
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+    def test_large_source_all_tiny_llm_summaries_fall_back_to_deterministic_l3(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            return "tiny"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 8000,
+            source_tokens=100_000,
+            token_budget=4_000,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            large_source_summary_min_source_tokens=100_000,
+            large_source_summary_min_result_tokens=50,
+        )
+
+        assert level == 3
+        assert "deterministic truncation" in summary
+        assert calls == [
+            "primary-model",
+            "fallback-model",
+            "primary-model",
+            "fallback-model",
+        ]
 
     def test_summary_circuit_breaker_skips_temporarily_open_route(self, monkeypatch):
         from hermes_lcm import escalation
@@ -728,6 +879,8 @@ class TestConfig:
         assert c.summary_fallback_models == []
         assert c.summary_circuit_breaker_failure_threshold == 2
         assert c.summary_circuit_breaker_cooldown_seconds == 300
+        assert c.large_source_summary_min_source_tokens == 100_000
+        assert c.large_source_summary_min_result_tokens == 512
         assert c.expansion_model == ""
         assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
@@ -747,6 +900,8 @@ class TestConfig:
         monkeypatch.setenv("LCM_SUMMARY_FALLBACK_MODELS", "fast-model, reliable-model")
         monkeypatch.setenv("LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3")
         monkeypatch.setenv("LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "120")
+        monkeypatch.setenv("LCM_LARGE_SOURCE_SUMMARY_MIN_SOURCE_TOKENS", "120000")
+        monkeypatch.setenv("LCM_LARGE_SOURCE_SUMMARY_MIN_RESULT_TOKENS", "768")
         monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "64000")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
@@ -785,6 +940,8 @@ class TestConfig:
         assert c.summary_fallback_models == ["fast-model", "reliable-model"]
         assert c.summary_circuit_breaker_failure_threshold == 3
         assert c.summary_circuit_breaker_cooldown_seconds == 120
+        assert c.large_source_summary_min_source_tokens == 120_000
+        assert c.large_source_summary_min_result_tokens == 768
         assert c.expansion_model == "openai/gpt-5.4-mini"
         assert c.expansion_context_tokens == 64_000
         assert c.summary_timeout_ms == 45_000
@@ -842,6 +999,34 @@ class TestConfig:
         c = LCMConfig.from_env()
 
         assert c.context_threshold == 0.68
+
+    def test_custom_instructions_yaml_is_ignored_without_official_env(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  custom_instructions: Write clear notes.\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CUSTOM_INSTRUCTIONS", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.custom_instructions == ""
+        assert "custom_instructions" in c.ignored_config_yaml_lcm_keys
+
+    def test_custom_instructions_env_overrides_hermes_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  custom_instructions: Write clear notes.\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        instructions = "Write clear notes.\nKeep the user's original wording."
+        monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", instructions)
+
+        c = LCMConfig.from_env()
+
+        assert c.custom_instructions == instructions
 
     def test_from_env_reads_hermes_codex_gpt55_autoraise_flag(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
@@ -4794,6 +4979,192 @@ class TestIngestExternalization:
         engine._session_id = "ingest-session"
         return engine, output_dir
 
+    def test_persisted_output_lookup_indexes_directory_once(self, tmp_path, monkeypatch):
+        import hermes_lcm.externalize as externalize
+
+        engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
+        for index in range(40):
+            (output_dir / f"decoy-{index:02d}.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "tool_result",
+                        "role": "tool",
+                        "session_id": "other-session",
+                        "tool_call_id": f"decoy-{index}",
+                        "content": f"decoy content {index}",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        target_path = output_dir / "target.json"
+        target_path.write_text(
+            json.dumps(
+                {
+                    "kind": "tool_result",
+                    "role": "tool",
+                    "session_id": "ingest-session",
+                    "tool_call_id": "call-target",
+                    "content": "durable target content",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        original_read_text = Path.read_text
+        reads_by_name: dict[str, int] = {}
+
+        def counting_read_text(path, *args, **kwargs):
+            if path.parent == output_dir:
+                reads_by_name[path.name] = reads_by_name.get(path.name, 0) + 1
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+        lookup_kwargs = {
+            "tool_call_id": "call-target",
+            "session_id": "ingest-session",
+            "config": engine._config,
+            "hermes_home": str(tmp_path / "hermes"),
+        }
+        assert (
+            externalize.find_externalized_tool_result_content_for_call(**lookup_kwargs)
+            == "durable target content"
+        )
+        reads_after_cold_lookup = dict(reads_by_name)
+        assert all(reads_after_cold_lookup.get(f"decoy-{index:02d}.json") == 1 for index in range(40))
+
+        assert (
+            externalize.find_externalized_tool_result_content_for_call(**lookup_kwargs)
+            == "durable target content"
+        )
+        assert all(reads_by_name.get(f"decoy-{index:02d}.json") == 1 for index in range(40))
+        assert reads_by_name["target.json"] == reads_after_cold_lookup["target.json"] + 1
+
+    def test_persisted_output_index_refreshes_after_internal_write(self, tmp_path, monkeypatch):
+        import hermes_lcm.externalize as externalize
+
+        engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
+        build_calls = 0
+        original_build = externalize._build_externalized_tool_result_index
+
+        def counting_build(storage_dir):
+            nonlocal build_calls
+            build_calls += 1
+            return original_build(storage_dir)
+
+        monkeypatch.setattr(externalize, "_build_externalized_tool_result_index", counting_build)
+        lookup_kwargs = {
+            "tool_call_id": "call-new",
+            "session_id": "ingest-session",
+            "config": engine._config,
+            "hermes_home": str(tmp_path / "hermes"),
+        }
+
+        assert externalize.find_externalized_tool_result_content_for_call(**lookup_kwargs) is None
+        assert build_calls == 1
+        created = externalize.maybe_externalize_payload(
+            "new durable tool output",
+            kind="tool_result",
+            tool_call_id="call-new",
+            session_id="ingest-session",
+            role="tool",
+            config=engine._config,
+            hermes_home=str(tmp_path / "hermes"),
+            force=True,
+        )
+        assert created is not None
+        assert (
+            externalize.find_externalized_tool_result_content_for_call(**lookup_kwargs)
+            == "new durable tool output"
+        )
+        assert build_calls == 2
+
+    def test_persisted_output_index_does_not_hide_concurrent_external_write(self, tmp_path):
+        import hermes_lcm.externalize as externalize
+
+        engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
+        lookup_kwargs = {
+            "tool_call_id": "call-external",
+            "session_id": "ingest-session",
+            "config": engine._config,
+            "hermes_home": str(tmp_path / "hermes"),
+        }
+        assert externalize.find_externalized_tool_result_content_for_call(**lookup_kwargs) is None
+
+        # Simulate a writer outside this process creating the payload between
+        # our cold lookup and a normal in-process externalization.
+        (output_dir / "external.json").write_text(
+            json.dumps(
+                {
+                    "kind": "tool_result",
+                    "role": "tool",
+                    "session_id": "ingest-session",
+                    "tool_call_id": "call-external",
+                    "content": "externally written durable content",
+                }
+            ),
+            encoding="utf-8",
+        )
+        created = externalize.maybe_externalize_payload(
+            "unrelated local output",
+            kind="tool_result",
+            tool_call_id="call-local",
+            session_id="ingest-session",
+            role="tool",
+            config=engine._config,
+            hermes_home=str(tmp_path / "hermes"),
+            force=True,
+        )
+        assert created is not None
+
+        assert (
+            externalize.find_externalized_tool_result_content_for_call(**lookup_kwargs)
+            == "externally written durable content"
+        )
+
+    def test_persisted_output_lookup_falls_back_when_cold_index_never_stabilizes(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import hermes_lcm.externalize as externalize
+
+        engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
+        (output_dir / "target.json").write_text(
+            json.dumps(
+                {
+                    "kind": "tool_result",
+                    "role": "tool",
+                    "session_id": "ingest-session",
+                    "tool_call_id": "call-target",
+                    "content": "fallback durable content",
+                }
+            ),
+            encoding="utf-8",
+        )
+        unstable_index = externalize._ExternalizedToolResultPathIndex(
+            directory_signature=None
+        )
+        monkeypatch.setattr(
+            externalize,
+            "_build_externalized_tool_result_index",
+            lambda _storage_dir: unstable_index,
+        )
+
+        assert (
+            externalize.find_externalized_tool_result_content_for_call(
+                tool_call_id="call-target",
+                session_id="ingest-session",
+                config=engine._config,
+                hermes_home=str(tmp_path / "hermes"),
+            )
+            == "fallback durable content"
+        )
+
     def test_ingest_recovers_hermes_persisted_output_marker_before_externalization(self, tmp_path, monkeypatch):
         import tempfile
         import hermes_lcm.tools as lcm_tools
@@ -6665,19 +7036,21 @@ class TestIngestExternalization:
         engine, output_dir = self._engine(tmp_path)
         content = "GENERIC_RAW_NEEDLE:" + ("z" * 5000)
 
-        engine._ingest_messages([{"role": "user", "content": content}])
+        provider_replay = engine._ingest_messages([{"role": "user", "content": content}])
 
         stored = engine._store.get_session_messages("ingest-session")
         assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
         assert "GENERIC_RAW_NEEDLE" not in stored[0]["content"]
         assert engine._store.search("GENERIC_RAW_NEEDLE", session_id="ingest-session") == []
+        assert provider_replay[0]["content"] == content
+        assert engine._last_active_replay_messages[0]["content"] == content
 
         payload = json.loads(next(output_dir.glob("*.json")).read_text())
         assert payload["kind"] == "raw_payload"
         assert payload["role"] == "user"
         assert payload["content"] == content
 
-    def test_compress_returns_externalized_stub_for_oversized_active_tail(self, tmp_path):
+    def test_compress_keeps_oversized_current_user_inline_while_store_uses_ref(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
         from hermes_lcm.engine import LCMEngine
 
@@ -6689,13 +7062,13 @@ class TestIngestExternalization:
 
         assert len(active_context) == 1
         active_content = active_context[0]["content"]
-        assert active_content.startswith("[Externalized payload: kind=raw_payload;")
-        assert "ACTIVE_RAW_NEEDLE" not in active_content
-        assert len(active_content) < 512
+        assert active_content == content
         assert messages[0]["content"] == content
 
         stored = engine._store.get_session_messages("ingest-session")
-        assert stored[0]["content"] == active_content
+        assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+        assert "ACTIVE_RAW_NEEDLE" not in stored[0]["content"]
+        assert len(stored[0]["content"]) < 512
         assert engine._get_store_ids_for_messages(active_context) == [stored[0]["store_id"]]
         assert engine._store.search("ACTIVE_RAW_NEEDLE", session_id="ingest-session") == []
         payload_path = next(output_dir.glob("*.json"))
@@ -6708,32 +7081,145 @@ class TestIngestExternalization:
         assert expanded["kind"] == "raw_payload"
         assert expanded["content"] == content
 
+        assert engine._last_active_replay_messages[0]["content"] == content
+
+        durable_history = [{"role": "user", "content": stored[0]["content"]}]
         replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay._session_id = "ingest-session"
         replay._ingest_cursor_needs_reconcile = True
-        replay._ingest_messages(active_context)
+        replay._ingest_messages(durable_history)
         assert replay._store.get_session_count("ingest-session") == 1
 
         replay_with_delta = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay_with_delta._session_id = "ingest-session"
         replay_with_delta._ingest_cursor_needs_reconcile = True
-        replay_with_delta._ingest_messages(active_context + [{"role": "user", "content": "followup"}])
+        replay_with_delta._ingest_messages(
+            durable_history + [{"role": "user", "content": "followup"}]
+        )
         rows = replay_with_delta._store.get_session_messages("ingest-session")
         assert len(rows) == 2
         assert rows[-1]["content"] == "followup"
 
-    def test_preflight_requests_cleanup_for_oversized_raw_payload_stub(self, tmp_path):
+    def test_preflight_does_not_replace_oversized_current_user_with_storage_ref(self, tmp_path):
         engine, _output_dir = self._engine(tmp_path)
         content = "PREFLIGHT_RAW_NEEDLE:" + ("r" * 5000)
         messages = [{"role": "user", "content": content}]
 
-        assert engine.should_compress_preflight(messages) is True
+        assert engine.should_compress_preflight(messages) is False
 
-        active_context = engine.compress(messages)
-        assert active_context[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
-        assert "PREFLIGHT_RAW_NEEDLE" not in active_context[0]["content"]
-        assert engine._last_compression_status == "sanitized"
-        assert engine._last_compression_noop_reason == ""
+        provider_replay = engine._ingest_messages(messages)
+        stored = engine._store.get_session_messages("ingest-session")
+        assert provider_replay[0]["content"] == content
+        assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+
+    def test_current_raw_user_stays_inline_through_tool_steps_and_next_user(self, tmp_path):
+        engine, _output_dir = self._engine(tmp_path)
+        content = "CURRENT_SKILL_PAYLOAD:" + ("s" * 5000)
+        user = {"role": "user", "content": content}
+
+        first_provider_replay = engine._ingest_messages([user])
+        assert first_provider_replay[0]["content"] == content
+
+        assistant_tool_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_current_turn", "function": {"name": "probe", "arguments": "{}"}}
+            ],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_current_turn",
+            "content": "probe complete",
+        }
+        same_turn = [user, assistant_tool_call, tool_result]
+        continuation_replay = engine._ingest_messages(same_turn)
+
+        assert continuation_replay[0]["content"] == content
+        assert engine._last_active_replay_messages[0]["content"] == content
+
+        next_turn = same_turn + [
+            {"role": "assistant", "content": "finished"},
+            {"role": "user", "content": "What is next?"},
+        ]
+        next_turn_replay = engine._ingest_messages(next_turn)
+
+        assert next_turn_replay[0]["content"] == content
+        assert next_turn_replay[-1]["content"] == "What is next?"
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith(
+            "[Externalized payload: kind=raw_payload;"
+        )
+        assert "CURRENT_SKILL_PAYLOAD" not in stored[0]["content"]
+
+    def test_restart_reconciles_provider_visible_raw_payload_history(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine, _output_dir = self._engine(tmp_path)
+        content = "RESTARTED_RAW_HISTORY:" + ("h" * 5000)
+        active_history = [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "completed answer"},
+        ]
+
+        provider_replay = engine._ingest_messages(active_history)
+        assert provider_replay == active_history
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        restarted = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        restarted._session_id = "ingest-session"
+        restarted._ingest_cursor_needs_reconcile = True
+        restarted._ingest_messages(provider_replay)
+
+        assert restarted._store.get_session_count("ingest-session") == 2
+        assert restarted._last_ingest_reconciliation["action"] == "advanced cursor"
+
+        restarted_with_delta = LCMEngine(
+            config=engine._config,
+            hermes_home=str(tmp_path / "hermes"),
+        )
+        restarted_with_delta._session_id = "ingest-session"
+        restarted_with_delta._ingest_cursor_needs_reconcile = True
+        next_turn = provider_replay + [{"role": "user", "content": "followup"}]
+        next_replay = restarted_with_delta._ingest_messages(next_turn)
+
+        assert next_replay[0]["content"] == content
+        rows = restarted_with_delta._store.get_session_messages("ingest-session")
+        assert len(rows) == 3
+        assert rows[-1]["content"] == "followup"
+
+    def test_storage_externalization_keeps_ordinary_assistant_payload_active(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import hermes_lcm.engine as lcm_engine
+
+        engine, _output_dir = self._engine(tmp_path)
+        assistant_content = "LONG_ASSISTANT_CONTEXT:" + ("a" * 5000)
+        messages = [
+            {"role": "user", "content": "Explain the result."},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": "Use that result for the next step."},
+        ]
+
+        def fail_summary(**_kwargs):
+            raise AssertionError("storage-only assistant externalization must not summarize")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_summary)
+
+        assert engine.should_compress_preflight(messages) is False
+        provider_replay = engine._cached_active_replay_messages(messages)
+
+        assert provider_replay is not None
+        assert provider_replay[1]["content"] == assistant_content
+        assert engine._last_active_replay_messages[1]["content"] == assistant_content
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[1]["content"].startswith(
+            "[Externalized payload: kind=raw_payload;"
+        )
+        assert "LONG_ASSISTANT_CONTEXT" not in stored[1]["content"]
 
     def test_non_tool_externalized_placeholder_sanitizes_role_metadata_for_ref_parsing(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
