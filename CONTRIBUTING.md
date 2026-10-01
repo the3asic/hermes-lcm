@@ -25,6 +25,8 @@ Use validation proportionate to the change. Runtime changes require relevant
 tests and the existing release checks below. Documentation-only changes can use
 `git diff --check` and link verification without rerunning pytest. Hotfixes follow
 the same review, validation, controlled deployment, and acceptance gates.
+Documentation-only or identical-runtime history changes do not require a restart;
+prove the runtime files match and retain the actual process startup identity.
 
 Review upstream changes through focused PRs instead of blindly synchronizing
 upstream `main`. Before deployment, inspect the actual production checkout and

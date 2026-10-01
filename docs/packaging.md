@@ -2,10 +2,12 @@
 
 ## Current decision
 
-`hermes-lcm` intentionally remains a clone-or-symlink Hermes user plugin for now. The supported install path is:
+`hermes-lcm` intentionally remains a clone-or-symlink Hermes user plugin for now.
+For this fork, use `the3asic/hermes-lcm` `main` under the
+[fork release policy](../CONTRIBUTING.md#fork-release-policy). The supported install path is:
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+git clone --branch main https://github.com/the3asic/hermes-lcm \
   ~/.hermes/plugins/hermes-lcm
 ```
 

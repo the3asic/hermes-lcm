@@ -10,17 +10,18 @@ This page holds the detailed install, activation, configuration, diagnostics, an
 
 ## Install
 
-Canonical install path: clone `hermes-lcm` as a general user plugin.
+For this fork, follow the [release policy](../CONTRIBUTING.md#fork-release-policy).
+Canonical install path: clone `the3asic/hermes-lcm` `main` as a general user plugin.
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+git clone --branch main https://github.com/the3asic/hermes-lcm \
   ~/.hermes/plugins/hermes-lcm
 ```
 
 For a profile-specific install:
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+git clone --branch main https://github.com/the3asic/hermes-lcm \
   ~/.hermes/profiles/myprofile/plugins/hermes-lcm
 ```
 
@@ -59,6 +60,12 @@ Restart Hermes after changing plugin or context-engine config.
 
 ## Update
 
+Follow the [fork release policy](../CONTRIBUTING.md#fork-release-policy): confirm
+the checkout tracks this fork's `main`, select the reviewed commit, inspect the
+live runtime and recovery point, and use controlled deployment and acceptance.
+The commands below and `scripts/update.sh` pull the current tracking branch;
+they do not independently select or validate a production release.
+
 If you cloned directly into the plugin directory:
 
 ```bash
@@ -77,7 +84,9 @@ If you installed a symlink from a separate checkout:
 ./scripts/update.sh
 ```
 
-Restart Hermes after updating.
+Runtime changes require the existing idle/drain and restart procedure. When
+only documentation or history changed, verify identical runtime files and
+retain the process startup identity without restarting Hermes.
 
 ## Upgrade from v0.20.0 or v0.21.0-rc2 to v1.0.0-rc.1
 
