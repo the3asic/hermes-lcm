@@ -9,6 +9,7 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 import json
 import logging
 import os
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -560,6 +561,33 @@ def register(ctx):
         from hermes_cli.plugins import get_plugin_manager as _get_pm
         _mgr = _get_pm()
 
+        from .engine_registry import _profile_registry_key
+
+        hooks = _mgr._hooks.setdefault("post_llm_call", [])
+        prototypes = weakref.WeakValueDictionary()
+        retired = []
+        for candidate in hooks:
+            is_current = getattr(candidate, "_lcm_ingest_namespace", None) == __name__
+            is_legacy = (
+                getattr(candidate, "__module__", "") == __name__
+                and getattr(candidate, "__qualname__", "")
+                == "register.<locals>._on_post_llm_call"
+            )
+            if not (is_current or is_legacy):
+                continue
+            retired.append(candidate)
+            if is_current:
+                prototypes.update(getattr(candidate, "_lcm_ingest_prototypes", {}))
+            else:
+                # Preserve live sibling prototypes while retiring the old strong
+                # closure. Do not close engines still owned by a host runtime.
+                cells = dict(zip(candidate.__code__.co_freevars, candidate.__closure__ or ()))
+                if "engine" in cells:
+                    legacy_engine = cells["engine"].cell_contents
+                    if getattr(legacy_engine, "name", None) == "lcm":
+                        prototypes[_profile_registry_key(legacy_engine._hermes_home)] = legacy_engine
+        prototypes[_profile_registry_key(engine._hermes_home)] = engine
+
         def _on_post_llm_call(**kwargs):
             history = kwargs.get("conversation_history")
             if not history:
@@ -580,13 +608,22 @@ def register(ctx):
             )
             platform = str(kwargs.get("platform") or "")
 
-            if active_engine is None:
-                active_engine = resolve_active_lcm_engine(
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                ) or engine
-
             try:
+                if active_engine is None:
+                    active_engine = resolve_active_lcm_engine(
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                    ) or prototypes.get(_profile_registry_key())
+                if active_engine is None:
+                    # Legacy single-profile hosts reuse one environment-backed
+                    # prototype across sequential home switches. Rebind before
+                    # ingest; a manager with multiple profile owners has no
+                    # unambiguous fallback and must skip an unknown route.
+                    candidates = list(prototypes.values())
+                    if len(candidates) == 1 and getattr(candidates[0], "_config_from_env", False):
+                        active_engine = candidates[0]
+                    else:
+                        return
                 # Session identity is authoritative for rebinding. Older hosts
                 # can deliver stale lane metadata alongside the correct active
                 # session id; rebinding a clone on conversation_id mismatch
@@ -601,7 +638,10 @@ def register(ctx):
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
+        _on_post_llm_call._lcm_ingest_namespace = __name__
+        _on_post_llm_call._lcm_ingest_prototypes = prototypes
+        hooks[:] = [hook for hook in hooks if not any(hook is old for old in retired)]
+        hooks.append(_on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)
