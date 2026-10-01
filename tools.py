@@ -1679,6 +1679,10 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     return total
 
 
+class _ExpansionSynthesisError(RuntimeError):
+    """The auxiliary response has no usable synthesis message."""
+
+
 def _synthesize_expansion_answer(
     *,
     prompt: str,
@@ -1717,7 +1721,15 @@ def _synthesize_expansion_answer(
     }
     apply_lcm_model_route(call_kwargs, model)
     response = call_llm(**call_kwargs)
-    content = response.choices[0].message.content
+    choices = getattr(response, "choices", None)
+    try:
+        first = choices[0]
+    except (TypeError, IndexError, KeyError):
+        raise _ExpansionSynthesisError("expansion synthesis returned no choices") from None
+    message = getattr(first, "message", None)
+    content = getattr(message, "content", None)
+    if not isinstance(content, str):
+        raise _ExpansionSynthesisError("expansion synthesis returned no text message")
     if not isinstance(content, str):
         content = str(content) if content else ""
     from .escalation import _strip_reasoning_blocks
@@ -5751,6 +5763,9 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             f"lcm_expand_query synthesis timed out after {timeout:.3g}s",
             include_timeout=True,
         )
+    except _ExpansionSynthesisError as exc:
+        logger.warning("LCM expand_query synthesis failed: %s", exc)
+        return _degraded_payload(f"lcm_expand_query synthesis unavailable: {exc}")
 
     answer = str(answer).strip() if answer is not None else ""
     if not answer:
