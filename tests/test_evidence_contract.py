@@ -336,7 +336,10 @@ def test_public_schema_adds_auto_mode_without_changing_default():
         ),
     }
     assert parameters["required"] == ["question", "baseline_refs"]
-    assert parameters["allOf"][0]["then"] == {"required": ["proposal"]}
+    # Dispatch enforces mode/proposal pairing; the wire schema stays flat.
+    assert "allOf" not in parameters
+    assert "oneOf" not in parameters
+    assert "anyOf" not in parameters
 
 
 def test_store_scan_is_one_bounded_snapshot_and_never_relabels_time(tmp_path):

@@ -686,14 +686,8 @@ LCM_COMPILE_EVIDENCE = {
             },
         },
         "required": ["question", "baseline_refs"],
-        "allOf": [
-            {
-                "if": {
-                    "properties": {"mode": {"const": "proposal"}},
-                },
-                "then": {"required": ["proposal"]},
-            }
-        ],
+        # Keep the wire schema flat for providers that reject top-level
+        # combinators. Dispatch still requires a proposal in proposal mode.
     },
 }
 
