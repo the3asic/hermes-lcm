@@ -536,3 +536,22 @@ def test_legacy_dispatcher_is_retired_without_closing_live_sibling(routed_plugin
         session_id="legacy-live", conversation_history=[{"role": "user", "content": "kept"}],
     )
     assert engine._store.get_session_messages("legacy-live")[0]["content"] == "kept"
+
+
+def test_routed_clone_does_not_inherit_sibling_live_compression_policy(routed_plugin):
+    host = routed_plugin
+    host.module.register(host.ctx)
+    prototype = host.engines[0]
+    prototype.update_model("test-model", 100000)
+    prototype._config_threshold_percent = 0.8
+    prototype.threshold_tokens_cap = 1000
+    prototype._threshold_tokens = None
+    token = host.active_home.set(host.homes["alpha"])
+    try:
+        clone = prototype.clone_for_agent()
+        host.engines.append(clone)
+        assert clone.context_threshold == 0.43
+        assert clone.threshold_tokens_cap is None
+        assert clone.threshold_tokens == 43000
+    finally:
+        host.active_home.reset(token)
