@@ -510,6 +510,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.effective_context_length_reason = ""
         self._context_length_source = ""
         self._update_model_pending_session_start = False
+        self.threshold_tokens_cap: int | None = None
+        self._host_threshold_percent: float | None = None
+        self._host_last_context_pin: int | None = None
+        self._host_unpinned_context_length = 0
         self.threshold_tokens = 0
         self.context_threshold = self._config.context_threshold
         self.threshold_percent = self.context_threshold
@@ -697,6 +701,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=None if self._config_from_env else copy.deepcopy(self._config),
             hermes_home="" if self._config_from_env else self._hermes_home,
         )
+        if _profile_registry_key(clone._hermes_home) == _profile_registry_key(self._hermes_home):
+            clone.threshold_tokens_cap = self.threshold_tokens_cap
+            clone._host_threshold_percent = self._host_threshold_percent
+            clone.model_thresholds = copy.deepcopy(getattr(self, "model_thresholds", {}))
+            clone._host_last_context_pin = self._host_last_context_pin
+            clone._host_unpinned_context_length = self._host_unpinned_context_length
+            clone._config_context_length = getattr(self, "_config_context_length", None)
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key
@@ -886,6 +897,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not hermes_home:
             return False
         if self._config_from_env and str(self._hermes_home) != str(hermes_home):
+            self._host_threshold_percent = None
+            self.threshold_tokens_cap = None
+            self.model_thresholds = {}
+            self._host_last_context_pin = None
             # Storage helpers capture config as well as paths. Reload before
             # binding them, even when LCM_DATABASE_PATH explicitly pins the DB.
             config = LCMConfig.from_env(hermes_home)
@@ -945,6 +960,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "env:LCM_CONTEXT_THRESHOLD",
             "config_yaml:lcm.context_threshold",
         }
+        host_ratio = getattr(self, "_host_threshold_percent", None)
+        if host_ratio is not None and self._config_from_env and not explicit_lcm_override:
+            configured = host_ratio
+            source = "host_live_compression"
+            # The host already loaded this resolver during its sync. Avoid
+            # importing a host bootstrap from standalone engine operations.
+            import sys
+            host_module = sys.modules.get("agent.context_compressor")
+            resolver = getattr(host_module, "resolve_model_threshold", None)
+            if callable(resolver):
+                configured = float(resolver(
+                    self.model if model is None else model,
+                    getattr(self, "model_thresholds", {}), configured,
+                    self.provider if provider is None else provider,
+                ))
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
         if (
@@ -978,6 +1008,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return raw_context_length, None, ""
 
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value: Any) -> int | None:
+        """Normalize the host's optional absolute trigger cap."""
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value) if value is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _effective_threshold_percent(self, context_length: int, base: float) -> float:
+        """Accept the host ratio; apply LCM priority at the sync boundary."""
+        return float(base)
+
+    @property
+    def _threshold_tokens(self) -> None:
+        return None
+
+    @_threshold_tokens.setter
+    def _threshold_tokens(self, value: Any) -> None:
+        # Hermes ends its complete live-config update by invalidating this
+        # cache. Consume that boundary instead of exposing an unused alias.
+        if value is not None or not getattr(self, "raw_context_length", 0):
+            return
+        if self._config_from_env:
+            config = LCMConfig.from_env(self._hermes_home)
+            self._config.context_threshold = config.context_threshold
+            self._config.config_sources["context_threshold"] = config.config_sources["context_threshold"]
+            self._config.codex_gpt55_autoraise_enabled = config.codex_gpt55_autoraise_enabled
+        self._host_threshold_percent = float(getattr(self, "_config_threshold_percent", self.threshold_percent))
+        pin = self._coerce_threshold_tokens_cap(getattr(self, "_config_context_length", None))
+        if pin is not None and self._host_last_context_pin is None:
+            self._host_unpinned_context_length = self.raw_context_length
+        window = pin or (
+            self._host_unpinned_context_length if self._host_last_context_pin is not None
+            else self.raw_context_length
+        )
+        self._host_last_context_pin = pin
+        self._set_context_length(window, source="host_live_compression", model=self.model, provider=self.provider)
+
     def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
         """Return the host-visible preflight trigger token count.
 
@@ -987,12 +1058,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         context-threshold value, so expose the stricter cap here; otherwise a
         tool/schema-heavy request can skip host preflight entirely.
         """
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is not None and assembly_cap > 0:
-            if context_threshold_tokens > 0:
-                return min(context_threshold_tokens, assembly_cap)
-            return assembly_cap
-        return context_threshold_tokens
+        caps = [cap for cap in (
+            context_threshold_tokens,
+            self._coerce_threshold_tokens_cap(self.threshold_tokens_cap),
+            self._effective_assembly_token_cap(),
+        ) if cap is not None and cap > 0]
+        return min(caps) if caps else 0
 
     def _set_context_length(
         self,
@@ -4233,7 +4304,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.api_key = str(api_key or "")
         self.provider = str(provider or "")
         self.api_mode = str(api_mode or "")
-        self._set_context_length(context_length, source="update_model")
+        updated = self._set_context_length(context_length, source="update_model")
+        if updated and self._host_last_context_pin is not None:
+            self._host_unpinned_context_length = self.raw_context_length
         self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
