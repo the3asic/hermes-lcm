@@ -5019,7 +5019,7 @@ class TestAssemblyBudgetSelection:
         replay._ingest_messages(reassembled)
         assert replay._store.get_session_count("assembly-session") == len(original)
 
-    @pytest.mark.parametrize("change", ["new_row_ids", "same_text_new_turn", "edited_tail"])
+    @pytest.mark.parametrize("change", ["new_row_ids", "same_text_new_turn", "edited_tail", "no_core_ids"])
     def test_summary_contiguous_tail_survives_core_row_id_replacement(self, tmp_path, monkeypatch, change):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=4000)
         original = [
@@ -5029,6 +5029,9 @@ class TestAssemblyBudgetSelection:
             {"role": "user", "content": "carried question", "_row_id": 12},
             {"role": "assistant", "content": "carried answer", "_row_id": 13},
         ]
+        if change == "no_core_ids":
+            for message in original:
+                message.pop("_row_id", None)
         engine._ingest_messages(original)
         engine._dag.add_node(SummaryNode(
             session_id="assembly-session", depth=0, summary="old exchange summary",
@@ -5036,6 +5039,10 @@ class TestAssemblyBudgetSelection:
             source_type="messages", expand_hint="old exchange",
         ))
         assembled = engine._assemble_context(original[0], original[-2:])
+        if change == "no_core_ids":
+            assert assembled[-2:] == original[-2:]
+            assert all("lcm_assembly_replay" not in msg.get("display_metadata", {}) for msg in assembled)
+            return
         assert all("lcm_assembly_replay" in msg.get("display_metadata", {}) for msg in assembled)
         # Core archive materializes a new durable transcript with new row IDs.
         cold = copy.deepcopy(assembled)

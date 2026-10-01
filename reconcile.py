@@ -241,6 +241,13 @@ class ReconcileMixin:
         selected = [index for index in source_indices if type(index) is int]
         if not sign_projection or not selected:
             return cleaned
+        contiguous = selected == list(range(min(selected), len(source_messages)))
+        core_carried = any(
+            type(source_messages[index].get("_row_id")) is int
+            and source_messages[index]["_row_id"] > 0 for index in selected
+        )
+        if contiguous and not core_carried:
+            return cleaned
         # Core's successful archive gives carried rows fresh IDs. Even a
         # contiguous tail needs durable source receipts after a cold reload.
         # Keep an already certified projection stable when reassembling it.
