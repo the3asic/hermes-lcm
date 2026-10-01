@@ -244,7 +244,11 @@ class ReconcileMixin:
         # Core's successful archive gives carried rows fresh IDs. Even a
         # contiguous tail needs durable source receipts after a cold reload.
         # Keep an already certified projection stable when reassembling it.
-        if self._reconcile_assembled_replay_cursor(cleaned) == len(cleaned):
+        if all(
+            isinstance(msg.get("display_metadata"), dict)
+            and isinstance(msg["display_metadata"].get(_ASSEMBLY_REPLAY_KEY), dict)
+            for msg in cleaned
+        ) and self._reconcile_assembled_replay_cursor(cleaned) == len(cleaned):
             return cleaned
         # Never certify an unknown raw occurrence or let the receipt change a
         # host-owned non-dictionary display value.
