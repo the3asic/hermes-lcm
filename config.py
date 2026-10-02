@@ -226,7 +226,155 @@ def _load_hermes_config_yaml(
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+# ``trigger_mode`` deliberately lives under the plugin's ``lcm`` section.  It
+# is the opt-in switch for the plugin-side Hermes adapter; it does not pretend
+# that Hermes Core sent a host-driven compaction signal.
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold", "trigger_mode"}
+
+_HERMES_TRIGGER_MODES = {"legacy", "hermes_config"}
+_HERMES_DEFAULT_COMPRESSION_THRESHOLD = 0.50
+_HERMES_DEFAULT_THRESHOLD_TOKENS = 256_000
+
+
+def _normalize_trigger_mode(value: Any, default: str = "legacy") -> str:
+    """Return a supported plugin trigger mode without failing config loading."""
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return normalized if normalized in _HERMES_TRIGGER_MODES else default
+
+
+def _hermes_trigger_mode_with_source(
+    default: str = "legacy", cfg: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Read the plugin-side trigger mode, with env overriding YAML.
+
+    The environment override is intentionally scalar and process-local, just
+    like the other ``LCM_*`` settings.  Unknown values fail closed to the
+    legacy LCM policy instead of silently changing compaction behaviour.
+    """
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    yaml_mode: Any = None
+    try:
+        lcm_section = cfg.get("lcm") or {}
+        if isinstance(lcm_section, dict):
+            yaml_mode = lcm_section.get("trigger_mode")
+    except Exception:
+        yaml_mode = None
+    raw = os.environ.get("LCM_TRIGGER_MODE")
+    if raw is not None:
+        normalized = _normalize_trigger_mode(raw, default)
+        if normalized == str(raw).strip().lower().replace("-", "_"):
+            return normalized, "env:LCM_TRIGGER_MODE"
+    if yaml_mode is not None:
+        normalized = _normalize_trigger_mode(yaml_mode, default)
+        if normalized != _normalize_trigger_mode(default):
+            return normalized, "config_yaml:lcm.trigger_mode"
+        # Preserve provenance for an explicitly supplied, valid ``legacy``.
+        if str(yaml_mode).strip().lower().replace("-", "_") == "legacy":
+            return normalized, "config_yaml:lcm.trigger_mode"
+    return _normalize_trigger_mode(default), "default"
+
+
+def _coerce_positive_threshold_tokens(value: Any) -> int | None:
+    """Match Hermes' positive-int cap normalization; ``null`` means no cap."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _hermes_model_threshold_key_rank(
+    key: str, model: str, provider: str,
+) -> tuple[int, int] | None:
+    """Mirror Hermes' longest-substring/provider-scoped model matching."""
+    scope, separator, substring = str(key).partition(":")
+    if not separator:
+        return (len(str(key)), 0) if str(key) in model else None
+    provider = str(provider or "").strip().lower()
+    return (len(substring), 1) if scope.strip().lower() == provider and substring in model else None
+
+
+def resolve_hermes_model_threshold(
+    model: str, model_thresholds: dict[str, float] | None,
+    default: float, provider: str = "",
+) -> float:
+    """Resolve a Hermes ``compression.model_thresholds`` ratio.
+
+    Bare keys match every provider; ``provider:substring`` keys are scoped to
+    that provider.  The longest matching substring wins, with a scoped key
+    winning a tie, exactly as Hermes Core's resolver does.
+    """
+    if not model_thresholds or not model:
+        return float(default)
+    ranked = (
+        (_hermes_model_threshold_key_rank(key, model, provider), key)
+        for key in model_thresholds
+    )
+    best = max(((rank, key) for rank, key in ranked if rank is not None), default=None)
+    return float(model_thresholds[best[1]]) if best else float(default)
+
+
+@dataclass(frozen=True)
+class HermesCompressionPolicy:
+    """The subset of Hermes compression config consumed by ``trigger_mode``."""
+
+    trigger_mode: str
+    trigger_mode_source: str
+    threshold: float
+    threshold_tokens: int | None
+    model_thresholds: dict[str, float]
+    threshold_source: str
+    threshold_tokens_source: str
+
+
+def load_hermes_compression_policy(
+    hermes_home: str | Path | None = None,
+) -> HermesCompressionPolicy:
+    """Load Hermes' compression threshold, model map, and absolute cap.
+
+    ``config.yaml`` is a user override layered on Hermes defaults.  Therefore
+    an absent ``threshold_tokens`` key resolves to Hermes' documented 256K
+    default, while an explicit YAML ``null`` remains ratio-only.
+    """
+    cfg = _load_hermes_config_yaml(hermes_home)
+    trigger_mode, trigger_mode_source = _hermes_trigger_mode_with_source("legacy", cfg)
+    compression = cfg.get("compression") if isinstance(cfg, dict) else None
+    compression = compression if isinstance(compression, dict) else {}
+
+    threshold = _HERMES_DEFAULT_COMPRESSION_THRESHOLD
+    threshold_source = "hermes_default:compression.threshold"
+    raw_threshold = compression.get("threshold")
+    try:
+        if raw_threshold is not None:
+            threshold = float(raw_threshold)
+            threshold_source = "config_yaml:compression.threshold"
+    except (TypeError, ValueError):
+        pass
+
+    if "threshold_tokens" in compression:
+        threshold_tokens = _coerce_positive_threshold_tokens(compression.get("threshold_tokens"))
+        threshold_tokens_source = "config_yaml:compression.threshold_tokens"
+    else:
+        threshold_tokens = _HERMES_DEFAULT_THRESHOLD_TOKENS
+        threshold_tokens_source = "hermes_default:compression.threshold_tokens"
+
+    raw_model_thresholds = compression.get("model_thresholds")
+    model_thresholds = {
+        str(key): float(value)
+        for key, value in raw_model_thresholds.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    } if isinstance(raw_model_thresholds, dict) else {}
+    return HermesCompressionPolicy(
+        trigger_mode=trigger_mode,
+        trigger_mode_source=trigger_mode_source,
+        threshold=threshold,
+        threshold_tokens=threshold_tokens,
+        model_thresholds=model_thresholds,
+        threshold_source=threshold_source,
+        threshold_tokens_source=threshold_tokens_source,
+    )
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -464,6 +612,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
+    "trigger_mode",
 })
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
@@ -490,6 +639,10 @@ class LCMConfig:
     leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
     context_threshold: float = 0.35
+    # ``legacy`` uses LCM's own threshold settings.  ``hermes_config`` makes
+    # the plugin read Hermes' existing compression.* values (including the
+    # absolute cap and model map) without requiring a Hermes Core patch.
+    trigger_mode: str = "legacy"
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.
@@ -857,6 +1010,15 @@ class LCMConfig:
             default_source=context_source,
         )
         _record("context_threshold", source, warning)
+        c.trigger_mode, source = _hermes_trigger_mode_with_source("legacy", cfg)
+        raw_trigger_mode = os.environ.get("LCM_TRIGGER_MODE")
+        if raw_trigger_mode is not None:
+            normalized_raw = str(raw_trigger_mode).strip().lower().replace("-", "_")
+            if normalized_raw not in _HERMES_TRIGGER_MODES:
+                config_source_warnings.append(
+                    f"invalid env LCM_TRIGGER_MODE={raw_trigger_mode!r} ignored"
+                )
+        _record("trigger_mode", source)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled, cfg
         )
