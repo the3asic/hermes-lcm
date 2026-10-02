@@ -826,6 +826,14 @@ def _case_concurrent_read_write_smoke(run: StressRun) -> None:
             thread.join(timeout=2)
     try:
         engine.on_session_end(engine.current_session_id, messages)
+        # Tool-call ingest reports failures in telemetry instead of throwing.
+        # A successful grep response must not hide a failed persistence path.
+        ingest_failures = engine._ingest_failure_count
+        run.record(case, "ingest_failure_count", ingest_failures)
+        if ingest_failures:
+            run.fail(case, "concurrent_ingest_errors", "Concurrent tool-call ingest failed", {
+                "count": ingest_failures, "last_error": engine._last_ingest_error,
+            })
         if thread_errors:
             run.fail(case, "concurrent_read_write_errors", "Concurrent read/write smoke produced lock or internal errors", {"errors": thread_errors[:20]})
         final = run.call_tool(engine, "lcm_grep", {"query": "CANARY_CONCURRENT_000", "limit": 5})

@@ -110,6 +110,28 @@ def test_stress_cli_refuses_non_empty_output_directory(tmp_path):
         ])
 
 
+def test_concurrent_stress_rejects_swallowed_ingest_failures(tmp_path, monkeypatch):
+    from benchmarking import stress
+
+    original = stress.StressRun.make_engine
+
+    def engine_with_ingest_failure(self, *args, **kwargs):
+        engine = original(self, *args, **kwargs)
+        engine._ingest_failure_count = 1
+        engine._last_ingest_error = "recorded persistence failure"
+        return engine
+
+    monkeypatch.setattr(stress.StressRun, "make_engine", engine_with_ingest_failure)
+    results = stress.run_stress_check(
+        output_dir=tmp_path / "failed-ingest",
+        tier="smoke",
+        scenarios=["concurrent_read_write_smoke"],
+    )
+    assert results["failure_count"] > 0
+    assert any(item["bug_id"] == "concurrent_ingest_errors" for item in results["failures"])
+    assert results["cases"]["concurrent_read_write_smoke"]["ingest_failure_count"] == 1
+
+
 @pytest.mark.filterwarnings("ignore:.*__package__ != __spec__.*:DeprecationWarning")
 def test_stress_cli_smoke_writes_results_summary_and_uses_output_sandbox(tmp_path):
     cli = _load_stress_cli()
