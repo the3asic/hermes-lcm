@@ -335,27 +335,21 @@ class MessageStore:
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
-        # ``self._conn`` is shared across threads (the connection is opened with
-        # ``check_same_thread=False``). SQLite's own C-level mutex serializes
-        # statements at the engine layer, but the Python ``sqlite3`` module
-        # releases the GIL while the C call runs. Under heavy thread contention
-        # with concurrent HTTPS clients in the same process, downstream
-        # operators have observed on-disk corruption that is consistent with
-        # external bytes landing inside SQLite's write path (e.g. the first
-        # 28 bytes of the database file replaced with a TLS record header +
-        # ciphertext while the "SQLit" magic remains intact).
-        #
-        # This re-entrant lock is defense-in-depth: it forces all write call
-        # sites that use ``self._conn`` to be serialized at the Python layer,
-        # eliminating any window where Python-side buffer reuse or memory
-        # aliasing could intersect SQLite's flush of a write. It does not
-        # change semantics for single-threaded callers and adds only a single
-        # uncontended ``RLock.acquire``/``release`` pair per operation.
+        # Serialize multi-statement write transactions on the shared connection.
+        # Readers also use it outside this lock; _init_db separately disables
+        # unsafe concurrent statement-cache reuse.
         self._write_lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        # Concurrent readers can reuse a cached statement while another thread
+        # binds/steps it (CPython #118172), corrupting results or raising
+        # InterfaceError. Disable statement reuse on this shared connection;
+        # retain the write lock for transaction-level serialization.
+        self._conn = sqlite3.connect(
+            str(self.db_path), timeout=5.0, check_same_thread=False,
+            cached_statements=0,
+        )
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
