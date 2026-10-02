@@ -417,10 +417,40 @@ state / cache-break signals.
 
 ### Threshold ownership
 
-When `context.engine: lcm` is active, `LCM_CONTEXT_THRESHOLD` is the compaction
-threshold LCM uses. Hermes core `compression.threshold` belongs to the built-in
-compressor. Hermes core `compression.enabled` is still the global gate that
-allows compaction, so leave it enabled when using LCM.
+When `context.engine: lcm` is active, the default `legacy` trigger mode uses
+LCM's `LCM_CONTEXT_THRESHOLD` (or `lcm.context_threshold`). Hermes core
+`compression.threshold` is only the fallback source used when those LCM
+overrides are absent. Hermes core `compression.enabled` is still the global
+gate that allows compaction, so leave it enabled when using LCM.
+
+Use the plugin-side adapter when the active LCM engine should follow Hermes'
+existing threshold policy in every gateway:
+
+```yaml
+lcm:
+  trigger_mode: hermes_config
+compression:
+  threshold: 0.286697247706422
+  threshold_tokens: 250000
+  model_thresholds:
+    "cliproxyapi:gpt-6.1-sol": 0.286697247706422
+```
+
+`hermes_config` reads `compression.threshold`, the longest matching
+`compression.model_thresholds` entry, and `compression.threshold_tokens` from
+the active profile. Hermes raises the effective ratio to at least 75% on
+windows under 512K and applies its small-window safety floor. The effective
+trigger is the lower of that ratio times the active LCM window and the absolute
+cap. The external LCM engine does not receive Hermes' private `max_tokens`
+reservation, so its adapter uses the full active window. An absent cap uses
+Hermes' 256,000 default; an explicit `null` is ratio-only. `LCM_TRIGGER_MODE`
+wins over the YAML mode. The LCM-specific threshold keys are ignored in this
+mode, which keeps the threshold rules in one place.
+
+This is a plugin-side adapter, not a new Hermes Core signal. Hermes still
+invokes the selected context engine; LCM performs the compaction after reading
+the same policy. Inspect `lcm_status` for `trigger_mode`, cap, model override,
+and value sources.
 
 Below this threshold, ingest protection may still ask the host to publish a
 sanitized replay (for example a recoverable tool-result ref or sensitive-value
