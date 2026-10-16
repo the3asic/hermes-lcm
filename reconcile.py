@@ -239,6 +239,17 @@ class ReconcileMixin:
                 source_index = None
             source_indices.append(source_index)
         selected = [index for index in source_indices if type(index) is int]
+        # The contiguous legacy tail needs no signed receipt, but its copied
+        # objects still carry the exact source occurrence through a proven
+        # compression rollover. Keep this association before early returns.
+        origins = getattr(self, "_active_replay_store_origins", {}).copy()
+        for message, index in zip(cleaned, source_indices):
+            if type(index) is int:
+                source = source_messages[index]
+                origin = origins.get(id(source))
+                if origin and origin[0] is source and origin[2] == self._session_id:
+                    origins[id(message)] = (message, origin[1], self._session_id)
+        self._active_replay_store_origins = origins
         if not sign_projection or not selected:
             return cleaned
         contiguous = selected == list(range(min(selected), len(source_messages)))
@@ -1549,7 +1560,26 @@ class ReconcileMixin:
         self, messages: List[Dict[str, Any]], *, require_unique: bool = False,
     ) -> dict[int, int]:
         with self._replay_identity_operation():
-            return self._get_store_id_map_for_messages_uncached(messages, require_unique=require_unique)
+            mapped = self._get_store_id_map_for_messages_uncached(messages, require_unique=require_unique)
+            # A proven rollover keeps raw ownership in its old session. Only
+            # exact, carried objects may bridge that direct parent; never search
+            # other sessions for equal text or reassign their immutable rows.
+            state = self._lifecycle.get_by_conversation(self._conversation_id)
+            parent = state.last_finalized_session_id if state and state.current_session_id == self._session_id else None
+            used = set(mapped.values())
+            origins = getattr(self, "_active_replay_store_origins", {})
+            for message in messages:
+                origin = origins.get(id(message))
+                if id(message) in mapped or not origin or origin[0] is not message or origin[2] != self._session_id:
+                    continue
+                source_id = origin[1]
+                if not parent or source_id <= self._last_compacted_store_id or source_id in used:
+                    continue
+                row = self._store.get(source_id)
+                if row and row.get("session_id") == parent and self._message_replay_identity(message) == self._message_replay_identity(row, stored_row=True):
+                    mapped[id(message)] = source_id
+                    used.add(source_id)
+            return mapped
 
     def _get_store_id_map_for_messages_uncached(
         self,
