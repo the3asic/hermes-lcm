@@ -216,6 +216,7 @@ class SummarySpendGuard:
     def clear(self) -> None:
         with self._lock:
             self._calls.clear()
+            self._reservations.clear()
             self._backoff_until = 0.0
 
 

@@ -143,3 +143,8 @@ def test_pending_reservation_limits_concurrency_without_false_spend():
     spend.release_call(token, attempted=True)
     assert not spend.allows()
     assert spend._reservations == {}
+    spend.clear()
+    token = spend.reserve_call()
+    spend.clear()  # A forced operation starts a new budget, including pending calls.
+    spend.release_call(token, attempted=True)
+    assert spend.allows()
