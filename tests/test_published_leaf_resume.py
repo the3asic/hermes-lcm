@@ -156,4 +156,3 @@ def test_host_timeout_signal_reaches_existing_route_breaker(engine):
     assert breaker.allows(model)
     engine.record_timeout_failure("host cancelled L2", failure_kind="stall_interrupted")
     assert not breaker.allows(model)
-
