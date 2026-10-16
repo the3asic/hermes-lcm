@@ -588,6 +588,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "budget_exhausted": False,
         }
         self._last_compression_status = "idle"
+        self._consecutive_timeout_failures = 0
         self._last_compression_noop_reason = ""
         self._last_compression_made_progress = False
         self._verify_compaction_cleared_threshold = False
@@ -2945,6 +2946,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         hermes_home = str(kwargs.get("hermes_home") or "")
         if not hermes_home and self._config_from_env:
             hermes_home = str(resolve_hermes_home())
+        if session_id != self._session_id or (
+            hermes_home and _profile_registry_key(hermes_home) != _profile_registry_key(self._hermes_home)
+        ):
+            self._consecutive_timeout_failures = 0
         if hermes_home:
             self._rebind_storage_for_home(hermes_home)
 

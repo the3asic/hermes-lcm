@@ -35,14 +35,19 @@ class CompactionMixin:
     def record_timeout_failure(self, error: str, failure_kind: str = "timeout") -> None:
         """Accept the host's end-to-end failure signal after its rollback.
 
-        A successful leaf must not hide a later stalled condensation from the
-        existing profile-local route breaker. Recovery of a published leaf
-        remains available while provider calls are in cooldown.
+        The host cannot identify which provider, if any, was still running.
+        Keep its pass-level signal separate from route health. Core reads this
+        counter when deciding whether another stalled pass needs deterministic
+        recovery; unused fallback routes must remain available.
         """
-        models = dict.fromkeys([self._config.summary_model, *self._config.summary_fallback_models])
-        for model in models:
-            self._summary_circuit_breaker.record_failure(model)
-        logger.warning("LCM host recorded %s; summary route failure retained", failure_kind)
+        self._consecutive_timeout_failures += 1
+        logger.warning("LCM host recorded %s; pass timeout retained", failure_kind)
+
+    def record_completed_compaction(
+        self, *, used_fallback: bool = False, feasibility_skip: bool = False,
+    ) -> None:
+        # Only the fenced host commit clears failures, never a late worker.
+        self._consecutive_timeout_failures = 0
 
     def _recover_published_raw_prefix(self, messages):
         """Reuse proven occurrences after publication outlives a host attempt.
