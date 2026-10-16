@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .fresh_tail import _assistant_group_start
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -31,6 +32,54 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def record_timeout_failure(self, error: str, failure_kind: str = "timeout") -> None:
+        """Accept the host's end-to-end failure signal after its rollback.
+
+        A successful leaf must not hide a later stalled condensation from the
+        existing profile-local route breaker. Recovery of a published leaf
+        remains available while provider calls are in cooldown.
+        """
+        models = dict.fromkeys([self._config.summary_model, *self._config.summary_fallback_models])
+        for model in models:
+            self._summary_circuit_breaker.record_failure(model)
+        logger.warning("LCM host recorded %s; summary route failure retained", failure_kind)
+
+    def _recover_published_raw_prefix(self, messages):
+        """Reuse proven occurrences after publication outlives a host attempt.
+
+        Object origins are established by ingestion (and Core's validated row
+        bridge after a reload). Never infer coverage from equal message text.
+        Stop at the first unknown occurrence and retain complete tool groups.
+        """
+        origins = getattr(self, "_active_replay_store_origins", {})
+        proven = {
+            id(message): origin[1]
+            for message in messages
+            for origin in [origins.get(id(message))]
+            if origin and origin[0] is message and origin[2] == self._session_id
+        }
+        proven.update(self._validated_core_row_origins(messages))
+        if not proven or self._last_compacted_store_id <= 0:
+            return messages, False
+        covered = self._dag.covered_message_ids(self._session_id, list(proven.values()))
+        leading = self._leading_anchor_count(messages)
+        end = leading
+        recovered = False
+        for index in range(leading, len(messages)):
+            message = messages[index]
+            if self._is_replayed_context_scaffold_message(message):
+                if recovered:
+                    break
+            elif proven.get(id(message)) in covered:
+                recovered = True
+            else:
+                break
+            end = index + 1
+        end = _assistant_group_start(messages, end)
+        if not recovered or end <= leading:
+            return messages, False
+        return messages[:leading] + messages[end:], True
+
     def _record_committed_leaf_failure(self, stage: str, started: float) -> None:
         """Record durable partial progress without hiding the later error."""
         self.compression_count += 1
@@ -434,6 +483,8 @@ class CompactionMixin:
         """Run compaction and leave a terminal public status on every failure."""
         self._last_compression_made_progress = False
         count_before = self.compression_count
+        frontier_before = self._last_compacted_store_id
+        started = time.perf_counter()
         try:
             compressed = self._compress_impl(
                 messages,
@@ -447,8 +498,11 @@ class CompactionMixin:
             return compressed
         except BaseException:
             if not (self._last_compression_status == "partial" and self.compression_count > count_before):
-                self._last_compression_status = "error"
-                self._last_compression_noop_reason = ""
+                if self._last_compacted_store_id > frontier_before:
+                    self._record_committed_leaf_failure("compaction", started)
+                else:
+                    self._last_compression_status = "error"
+                    self._last_compression_noop_reason = ""
             raise
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
@@ -542,8 +596,9 @@ class CompactionMixin:
         )
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
         anchor_source_messages = list(working_messages)
+        working_messages, recovered_published_prefix = self._recover_published_raw_prefix(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
-        leaf_compacted_this_turn = False
+        leaf_compacted_this_turn = recovered_published_prefix
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
         estimated_active_tokens = (
@@ -614,7 +669,7 @@ class CompactionMixin:
         dependent_reply_message_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
-        while leaf_passes < max_leaf_passes:
+        while not recovered_published_prefix and leaf_passes < max_leaf_passes:
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
@@ -792,7 +847,40 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
-            prepared_ids = sorted(set(self._get_store_ids_for_messages(selected_raw_chunk)))
+            selected_mapping = self._get_store_id_map_for_messages(selected_raw_chunk)
+            required_sources = [
+                message for message in selected_raw_chunk
+                if id(message) not in dependent_reply_message_ids
+            ]
+            if any(id(message) not in selected_mapping for message in required_sources):
+                first_unknown = next(
+                    index for index, message in enumerate(selected_raw_chunk)
+                    if id(message) not in dependent_reply_message_ids and id(message) not in selected_mapping
+                )
+                # Do not consume a later mapped occurrence across an unknown
+                # raw occurrence, or split a tool request from its real result.
+                safe_end = _assistant_group_start(selected_raw_chunk, first_unknown)
+                if safe_end <= 0:
+                    noop_reason = "selected leaf chunk lacks complete raw store lineage"
+                    break
+                selected_raw_chunk = selected_raw_chunk[:safe_end]
+            required_sources = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
+            if not required_sources:
+                # These occurrences were explicitly marked as replies derived
+                # from ignored input. Consume the deterministic cleanup without
+                # inventing an empty-source summary or paying for a model call.
+                filtered_ids = [selected_mapping[id(message)] for message in selected_raw_chunk if id(message) in selected_mapping]
+                if len(filtered_ids) == len(selected_raw_chunk):
+                    frontier = max(self._last_compacted_store_id, *filtered_ids)
+                    state = self._lifecycle.advance_frontier(self._conversation_id, self._session_id, frontier)
+                    if state is not None and state.current_session_id == self._session_id:
+                        self._last_compacted_store_id = state.current_frontier_store_id
+                selected_count = len(selected_raw_chunk)
+                working_messages = working_messages[:leading_anchor_count] + working_messages[leading_anchor_count + selected_count:]
+                pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[leading_anchor_count + selected_count:]
+                dropped_replayed_scaffold_messages = True
+                continue
+            prepared_ids = sorted({selected_mapping[id(message)] for message in selected_raw_chunk if id(message) in selected_mapping})
             publication_snapshot, validate_publication = self._prepare_summary_publication(
                 prepared_ids, "messages",
             )
@@ -872,9 +960,11 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            source_store_ids = [selected_mapping[id(message)] for message in source_lineage_chunk if id(message) in selected_mapping]
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            if not source_store_ids or len(source_store_ids) != len(source_lineage_chunk):
+                raise ValueError("leaf publication requires complete nonempty raw store lineage")
+            consumed_store_ids = [selected_mapping[id(message)] for message in source_lookup_chunk if id(message) in selected_mapping]
             consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
@@ -892,7 +982,7 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            frontier = max(consumed_store_ids) if consumed_store_ids else 0
+            frontier = max(self._last_compacted_store_id, *consumed_store_ids)
             self._dag.publish_node(
                 node, publication_snapshot, frontier_store_id=frontier,
                 validate_runtime=validate_publication,
@@ -1029,7 +1119,11 @@ class CompactionMixin:
         # condenses after the eligible raw prefix has been drained, and shares
         # the same total pass/deadline budget as its leaf work.
         condensation_passes = 0
-        if threshold_full_sweep_active:
+        if recovered_published_prefix:
+            # Finish adoption of the already-paid leaf before optional work.
+            # Re-running the failed condensation would prevent this recovery.
+            self._last_condensation_suppressed_reason = "published_leaf_recovery"
+        elif threshold_full_sweep_active:
             if sweep_raw_drained:
                 remaining_passes = max(
                     0,
@@ -1051,7 +1145,7 @@ class CompactionMixin:
                     force_overflow=force_overflow,
                     critical_budget_pressure=critical_budget_pressure,
                 )
-            except Exception:
+            except BaseException:
                 self._record_committed_leaf_failure("condensation", _compress_started)
                 raise
 
@@ -1069,7 +1163,7 @@ class CompactionMixin:
                 working_messages[leading_anchor_count:],
                 assembly_cap_override=recovery_assembly_cap,
             )
-        except Exception:
+        except BaseException:
             self._record_committed_leaf_failure("assembly", _compress_started)
             raise
         finally:

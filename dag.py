@@ -658,6 +658,33 @@ class SummaryDAG:
             ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def covered_message_ids(self, session_id: str, message_ids: Sequence[int]) -> set[int]:
+        """Return requested raw occurrences covered by a recent durable leaf.
+
+        Bound recovery to the active session's latest 1,000 leaves. Missing
+        older coverage is conservative: it never authorizes dropping raw text.
+        """
+        requested = sorted(set(message_ids))
+        covered: set[int] = set()
+        with self._db_lock:
+            for offset in range(0, len(requested), 500):
+                batch = requested[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(
+                    f"""WITH leaves AS (
+                            SELECT source_ids FROM summary_nodes
+                            WHERE session_id = ? AND source_type = 'messages'
+                              AND depth = 0 AND length(trim(summary)) > 0
+                            ORDER BY node_id DESC LIMIT 1000
+                        )
+                        SELECT DISTINCT CAST(j.value AS INTEGER)
+                        FROM leaves, json_each(leaves.source_ids) j
+                        WHERE j.type = 'integer' AND j.value IN ({placeholders})""",
+                    (session_id, *batch),
+                ).fetchall()
+                covered.update(row[0] for row in rows)
+        return covered
+
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
