@@ -866,8 +866,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return min(120.0, max(0.1, value))
 
     def _reset_profile_runtime_state(self) -> None:
-        self._consecutive_timeout_failures = 0
         """Clear process-local session state that cannot cross profile homes."""
+        self._consecutive_timeout_failures = 0
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
