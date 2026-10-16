@@ -2894,6 +2894,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # old/child session as missing even though its payload was only
             # reassigned to the next compression segment.
             moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
+            self._active_replay_store_origins = {
+                key: (origin[0], origin[1], session_id) if origin[2] == source_session_id else origin
+                for key, origin in self._active_replay_store_origins.items()
+            }
             logger.debug(
                 "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
@@ -5085,7 +5089,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
-                return cached_replay
+                return self._remember_active_replay_messages(messages, cached_replay)
             return self._remember_active_replay_messages(messages, replay_messages)
 
         active_replay_messages = replay_messages

@@ -51,7 +51,7 @@ def compress_then_host_rollback(engine):
     return original, before
 
 
-def test_rollback_then_next_leaf_appends_only_new_core_occurrences(engine):
+def test_rollback_reassembles_published_leaf_and_appends_only_new_core_occurrences(engine):
     original, before = compress_then_host_rollback(engine)
     replay = copy.deepcopy(original)
     replay += [
@@ -66,7 +66,9 @@ def test_rollback_then_next_leaf_appends_only_new_core_occurrences(engine):
     assert sum(row["content"] == original[0]["content"] for row in after) == 4
     assert after[-2]["content"] == original[0]["content"]
     assert after[-1]["content"] == "new answer"
-    assert len(engine._dag.get_session_nodes("session")) == 2
+    # Adopt the already-published leaf before doing another paid leaf pass.
+    assert len(engine._dag.get_session_nodes("session")) == 1
+    assert [message["content"] for message in result[-4:]] == [message["content"] for message in replay[-4:]]
     assert engine._lifecycle.get_by_conversation("lane").current_session_id == "session"
 
 
