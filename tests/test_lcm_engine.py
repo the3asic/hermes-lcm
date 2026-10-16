@@ -13240,6 +13240,7 @@ class TestSessionRollover:
         engine._last_compacted_store_id = foreground_store_id
         foreground_conversation_id = engine._conversation_id
 
+        engine.record_timeout_failure("foreground stall before child start")
         child = self._start_host_child(
             engine,
             hermes_home,
@@ -13247,6 +13248,7 @@ class TestSessionRollover:
             "foreground-session",
         )
         assert engine._session_id == "foreground-session"
+        assert engine._consecutive_timeout_failures == 1
         assert engine._thread_context_session_id() == ""
         assert engine._thread_context_has_auxiliary_session("background-review-session")
         assert engine._conversation_id == foreground_conversation_id

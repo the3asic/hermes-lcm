@@ -588,6 +588,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "budget_exhausted": False,
         }
         self._last_compression_status = "idle"
+        self._consecutive_timeout_failures = 0
         self._last_compression_noop_reason = ""
         self._last_compression_made_progress = False
         self._verify_compaction_cleared_threshold = False
@@ -866,6 +867,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        self._consecutive_timeout_failures = 0
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
@@ -2527,6 +2529,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._lifecycle.clear_debt(self._conversation_id)
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
+        if session_id != self._session_id:
+            self._consecutive_timeout_failures = 0
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()

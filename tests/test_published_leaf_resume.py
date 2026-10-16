@@ -148,11 +148,34 @@ def test_cold_reload_recovers_durable_core_occurrences(engine, monkeypatch):
         revived.shutdown()
 
 
-def test_host_timeout_signal_reaches_existing_route_breaker(engine):
+def test_host_timeout_tracks_pass_without_poisoning_route_health(engine):
     breaker = engine._summary_circuit_breaker
     model = engine._config.summary_model
-    breaker.record_success(model)  # A successful leaf in this same pass.
-    breaker.record_failure(model)  # Condensation L1 rejected its output.
-    assert breaker.allows(model)
+    engine._config.summary_fallback_models = ["healthy-unused-backup"]
+    breaker.failure_threshold = 1
     engine.record_timeout_failure("host cancelled L2", failure_kind="stall_interrupted")
-    assert not breaker.allows(model)
+    assert engine._consecutive_timeout_failures == 1
+    assert breaker.allows(model)
+    assert breaker.allows("healthy-unused-backup")
+    engine.record_timeout_failure("another host cancellation")
+    assert engine._consecutive_timeout_failures == 2
+    engine.on_session_start("session", conversation_id="lane", context_length=200000)
+    assert engine._consecutive_timeout_failures == 2
+    engine.record_completed_compaction(used_fallback=False)
+    assert engine._consecutive_timeout_failures == 0
+    assert engine._verify_compaction_cleared_threshold
+    engine.awaiting_real_usage_after_compression = True
+    engine.last_compression_rough_tokens = 100
+    engine.threshold_tokens = 1000
+    engine.update_from_response({"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110})
+    assert not engine.awaiting_real_usage_after_compression
+    assert not engine._verify_compaction_cleared_threshold
+    engine.record_timeout_failure("cancelled again")
+    clone = engine.clone_for_agent()
+    try:
+        assert clone._consecutive_timeout_failures == 0
+        assert engine._consecutive_timeout_failures == 1
+    finally:
+        clone.shutdown()
+    engine.on_session_start("other-session", context_length=200000)
+    assert engine._consecutive_timeout_failures == 0
