@@ -163,6 +163,13 @@ def test_host_timeout_tracks_pass_without_poisoning_route_health(engine):
     assert engine._consecutive_timeout_failures == 2
     engine.record_completed_compaction(used_fallback=False)
     assert engine._consecutive_timeout_failures == 0
+    assert engine._verify_compaction_cleared_threshold
+    engine.awaiting_real_usage_after_compression = True
+    engine.last_compression_rough_tokens = 100
+    engine.threshold_tokens = 1000
+    engine.update_from_response({"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110})
+    assert not engine.awaiting_real_usage_after_compression
+    assert not engine._verify_compaction_cleared_threshold
     engine.record_timeout_failure("cancelled again")
     clone = engine.clone_for_agent()
     try:

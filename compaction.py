@@ -48,6 +48,7 @@ class CompactionMixin:
     ) -> None:
         # Only the fenced host commit clears failures, never a late worker.
         self._consecutive_timeout_failures = 0
+        self._verify_compaction_cleared_threshold = True
 
     def _recover_published_raw_prefix(self, messages):
         """Reuse proven occurrences after publication outlives a host attempt.

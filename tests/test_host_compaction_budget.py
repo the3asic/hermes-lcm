@@ -30,7 +30,7 @@ class _CompactionHost:
             self.engine.awaiting_real_usage_after_compression = True
         # The real host sets this only after the transcript commit succeeds.
         if getattr(self.engine, "_last_compression_made_progress", False):
-            self.engine._verify_compaction_cleared_threshold = True
+            self.engine.record_completed_compaction(used_fallback=False)
         return compressed
 
     def receive_usage(self, prompt_tokens):
