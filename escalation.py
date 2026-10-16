@@ -57,6 +57,7 @@ _REASONING_START_RE = re.compile(
 )
 
 _DEFAULT_ROUTE_KEY = "<task-default>"
+_MIN_ROUTE_HEALTH_BUDGET_FRACTION = 0.5
 
 
 @dataclass
@@ -132,6 +133,7 @@ class SummarySpendGuard:
     window_seconds: float = 600.0
     backoff_seconds: float = 1800.0
     _calls: list[float] = field(default_factory=list)
+    _reservations: dict[object, float] = field(default_factory=dict)
     _backoff_until: float = 0.0
     _lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -144,6 +146,10 @@ class SummarySpendGuard:
         if self._calls and self._calls[0] < cutoff:
             self._calls = [t for t in self._calls if t >= cutoff]
 
+    def _pending_count(self, current_time: float) -> int:
+        cutoff = current_time - self.window_seconds
+        return sum(started >= cutoff for started in self._reservations.values())
+
     def allows(self, *, now: float | None = None) -> bool:
         if self.max_calls <= 0:
             return True
@@ -152,7 +158,29 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            return len(self._calls) < self.max_calls
+            return len(self._calls) + self._pending_count(current_time) < self.max_calls
+
+    def reserve_call(self) -> object | None:
+        """Reserve capacity without charging spend until dispatch is confirmed."""
+        token = object()
+        if self.max_calls <= 0:
+            return token
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if now < self._backoff_until or len(self._calls) + self._pending_count(now) >= self.max_calls:
+                return None
+            self._reservations[token] = now
+        return token
+
+    def release_call(self, token: object, *, attempted: bool) -> None:
+        with self._lock:
+            reserved_at = self._reservations.pop(token, None)
+            if attempted and reserved_at is not None and self.max_calls > 0:
+                now = time.monotonic()
+                self._prune(now)
+                if reserved_at >= now - self.window_seconds:
+                    self._record_call_locked(reserved_at)
 
     def try_record_call(self, *, now: float | None = None) -> bool:
         """Atomically reserve one provider call if the budget allows it."""
@@ -163,13 +191,14 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            if len(self._calls) >= self.max_calls:
+            if len(self._calls) + self._pending_count(current_time) >= self.max_calls:
                 return False
             self._record_call_locked(current_time)
             return True
 
     def _record_call_locked(self, current_time: float) -> None:
         self._calls.append(current_time)
+        self._calls.sort()  # Concurrent reservations may finish out of order.
         if len(self._calls) >= self.max_calls and self._backoff_until <= current_time:
             self._backoff_until = current_time + max(0.0, self.backoff_seconds)
             # Backoff is the penalty; start the window fresh so the guard allows
@@ -194,6 +223,7 @@ class SummarySpendGuard:
     def clear(self) -> None:
         with self._lock:
             self._calls.clear()
+            self._reservations.clear()
             self._backoff_until = 0.0
 
 
@@ -354,26 +384,46 @@ def _invoke_summary_llm_chain(
             continue
         # Check the spend guard per-route so a mid-chain trip stops the
         # remaining fallbacks instead of over-spending by up to len(chain)-1.
-        if spend_guard is not None and not spend_guard.try_record_call():
+        reservation = spend_guard.reserve_call() if spend_guard is not None else None
+        if spend_guard is not None and reservation is None:
             logger.warning(
                 "LCM summary spend guard active; skipping LLM summarization and "
                 "deferring to deterministic fallback"
             )
             break
+        # Profile-local guard locks can consume the remaining operation budget.
+        # Recompute immediately before dispatch instead of forwarding a stale timeout.
+        attempted = False
         try:
-            result = _invoke_summary_llm(
-                prompt,
-                max_tokens,
-                model=candidate_model,
-                timeout=remaining if remaining is not None else timeout,
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                break
+            # A timeout needs at least half the configured window to be a
+            # route-health verdict. Near-full retries still count as failures.
+            budget_starved = (
+                remaining is not None and timeout is not None
+                and remaining < float(timeout) * _MIN_ROUTE_HEALTH_BUDGET_FRACTION
             )
-        except Exception as exc:
-            logger.warning("LLM summarization failed: %s", exc)
-            result = None
+            attempted = True
+            try:
+                result = _invoke_summary_llm(
+                    prompt, max_tokens, model=candidate_model,
+                    timeout=remaining if remaining is not None else timeout,
+                )
+            except Exception as exc:
+                logger.warning("LLM summarization failed: %s", exc)
+                result = None
+        finally:
+            if spend_guard is not None and reservation is not None:
+                spend_guard.release_call(reservation, attempted=attempted)
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
             return result
+        # An empty result at the operation deadline is not evidence that this
+        # route is unhealthy: a previous route may have spent almost all its time.
+        if not result and budget_starved and deadline is not None and time.monotonic() >= deadline:
+            break
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
@@ -688,6 +738,9 @@ def summarize_with_escalation(
     if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return _deterministic_truncate(text, min(l3_truncate_tokens, token_budget)), 3
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
