@@ -866,6 +866,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return min(120.0, max(0.1, value))
 
     def _reset_profile_runtime_state(self) -> None:
+        self._consecutive_timeout_failures = 0
         """Clear process-local session state that cannot cross profile homes."""
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
@@ -2528,6 +2529,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._lifecycle.clear_debt(self._conversation_id)
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
+        if session_id != self._session_id:
+            self._consecutive_timeout_failures = 0
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
@@ -2946,10 +2949,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         hermes_home = str(kwargs.get("hermes_home") or "")
         if not hermes_home and self._config_from_env:
             hermes_home = str(resolve_hermes_home())
-        if session_id != self._session_id or (
-            hermes_home and _profile_registry_key(hermes_home) != _profile_registry_key(self._hermes_home)
-        ):
-            self._consecutive_timeout_failures = 0
         if hermes_home:
             self._rebind_storage_for_home(hermes_home)
 
