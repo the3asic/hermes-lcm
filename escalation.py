@@ -267,11 +267,18 @@ def _sanitize_reasoning_summary(text: str) -> str:
     return stripped
 
 
+class _SummaryDispatchSkipped(Exception):
+    """The operation expired or admission ended before any provider call."""
+
+
 def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
-                           model: str = "", timeout: float | None = None) -> Optional[str]:
-    """Call the Hermes auxiliary LLM for summarization."""
+                           model: str = "", timeout: float | None = None,
+                           deadline: float | None = None,
+                           before_dispatch: Callable[[], float] | None = None) -> Optional[str]:
+    """Call the Hermes auxiliary LLM within the operation's absolute budget."""
+    from agent.auxiliary_client import call_llm
+
     try:
-        from agent.auxiliary_client import call_llm
         if isinstance(prompt, str):
             messages = build_untrusted_data_messages(
                 operation="lcm_summary_direct",
@@ -295,6 +302,14 @@ def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
             "max_tokens": max_tokens,
         }
         apply_lcm_model_route(call_kwargs, model)
+        # Imports, route resolution and logging can consume the entire budget.
+        # Admit spend only after those steps, adjacent to the actual host call.
+        dispatched_at = before_dispatch() if before_dispatch is not None else time.monotonic()
+        if deadline is not None:
+            remaining = deadline - dispatched_at
+            if remaining <= 0:
+                raise _SummaryDispatchSkipped("operation expired during request preparation")
+            timeout = remaining if timeout is None else min(timeout, remaining)
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
@@ -308,23 +323,45 @@ def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
                 model or "<default>",
             )
         return sanitized
+    except _SummaryDispatchSkipped:
+        raise
     except Exception as e:
         logger.warning("LLM summarization failed: %s", e)
         return None
 
 
 def _invoke_summary_llm(prompt: str | list[dict[str, str]], max_tokens: int,
-                        model: str = "", timeout: float | None = None) -> Optional[str]:
+                        model: str = "", timeout: float | None = None,
+                        deadline: float | None = None,
+                        before_dispatch: Callable[[], float] | None = None) -> Optional[str]:
     kwargs = {"model": model} if model else {}
-    if timeout is not None:
-        try:
-            sig = inspect.signature(_call_llm_for_summary)
-            if "timeout" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
-                kwargs["timeout"] = timeout
-        except Exception:
-            pass
+    parameters = inspect.signature(_call_llm_for_summary).parameters
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+    def accepts(name: str) -> bool:
+        return name in parameters or accepts_kwargs
+
+    # Check again after inspection; it may execute a callable's signature hook.
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _SummaryDispatchSkipped("operation expired during signature inspection")
+        timeout = remaining if timeout is None else min(timeout, remaining)
+        if accepts("deadline"):
+            kwargs["deadline"] = deadline
+    if before_dispatch is not None:
+        if "before_dispatch" in parameters:
+            kwargs["before_dispatch"] = before_dispatch
+        else:
+            # Older embedding callbacks have no inner provider boundary.
+            dispatched_at = before_dispatch()
+            if deadline is not None:
+                remaining = deadline - dispatched_at
+                if remaining <= 0:
+                    raise _SummaryDispatchSkipped("operation expired during provider admission")
+                timeout = remaining if timeout is None else min(timeout, remaining)
+    if timeout is not None and accepts("timeout"):
+        kwargs["timeout"] = timeout
     return _call_llm_for_summary(prompt, max_tokens, **kwargs)
 
 
@@ -401,36 +438,52 @@ def _invoke_summary_llm_chain(
                 "deferring to deterministic fallback"
             )
             break
-        # Profile-local guard locks can consume the remaining operation budget.
-        # Recompute immediately before dispatch instead of forwarding a stale timeout.
         reservation_pending = reservation is not None
-        try:
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                break
-            if reservation_pending:
-                dispatch_at = spend_guard.commit_call(reservation, deadline=deadline)
+        dispatched_at = None
+
+        def before_dispatch() -> float:
+            nonlocal reservation_pending, dispatched_at
+            if dispatched_at is not None:
+                raise RuntimeError("Summary provider admission may run only once")
+            if spend_guard is not None:
+                admitted_at = spend_guard.commit_call(reservation, deadline=deadline)
                 reservation_pending = False
-                if dispatch_at is None:
-                    break
-                remaining = None if deadline is None else deadline - dispatch_at
-            # A timeout needs at least half the configured window to be a
-            # route-health verdict. Near-full retries still count as failures.
-            budget_starved = (
-                remaining is not None and timeout is not None
-                and remaining < float(timeout) * _MIN_ROUTE_HEALTH_BUDGET_FRACTION
-            )
+                if admitted_at is None:
+                    raise _SummaryDispatchSkipped("provider admission ended before dispatch")
+            else:
+                admitted_at = time.monotonic()
+                if deadline is not None and admitted_at >= deadline:
+                    raise _SummaryDispatchSkipped("operation expired before provider dispatch")
+            dispatched_at = admitted_at
+            return admitted_at
+
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 result = _invoke_summary_llm(
                     prompt, max_tokens, model=candidate_model,
-                    timeout=remaining if remaining is not None else timeout,
+                    timeout=timeout, deadline=deadline, before_dispatch=before_dispatch,
                 )
+            except _SummaryDispatchSkipped as exc:
+                logger.warning("LCM summary request not started: %s", exc)
+                break
+            except ImportError:
+                raise
             except Exception as exc:
                 logger.warning("LLM summarization failed: %s", exc)
                 result = None
         finally:
             if spend_guard is not None and reservation_pending:
                 spend_guard.release_call(reservation)
+        # Preparation errors do not establish provider health or consume spend.
+        if dispatched_at is None:
+            break
+        remaining = None if deadline is None else deadline - dispatched_at
+        budget_starved = (
+            remaining is not None and timeout is not None
+            and remaining < float(timeout) * _MIN_ROUTE_HEALTH_BUDGET_FRACTION
+        )
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
