@@ -458,6 +458,8 @@ def _invoke_summary_llm_chain(
             return admitted_at
 
         try:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 result = _invoke_summary_llm(
                     prompt, max_tokens, model=candidate_model,
