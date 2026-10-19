@@ -6464,6 +6464,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_new_session_no_hash_poison.db"
         first = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6502,6 +6503,7 @@ class TestMessageFiltering:
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
         second = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6532,6 +6534,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_session_normal_new.db"
         engine = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6594,6 +6597,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover.db"
         first = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6630,6 +6634,7 @@ class TestMessageFiltering:
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
         second = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6666,6 +6671,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_fresh_tail.db"
         first = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6696,6 +6702,7 @@ class TestMessageFiltering:
 
         second = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=10,
                 leaf_chunk_tokens=10,
@@ -6723,6 +6730,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_new_literal.db"
         first = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6753,6 +6761,7 @@ class TestMessageFiltering:
 
         second = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=10,
                 leaf_chunk_tokens=10,
@@ -6778,6 +6787,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_source_literal_after_frontier.db"
         first = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=1,
                 leaf_chunk_tokens=10,
@@ -6809,6 +6819,7 @@ class TestMessageFiltering:
 
         second = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=10,
                 leaf_chunk_tokens=10,
@@ -7405,6 +7416,7 @@ class TestMessageFiltering:
     def test_duplicate_carried_ignored_placeholders_after_rollover_are_not_stored(self, tmp_path):
         engine = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(tmp_path / "lcm_msg_ignore_placeholder_rollover_duplicate.db"),
                 fresh_tail_count=2,
                 leaf_chunk_tokens=10,
@@ -7454,6 +7466,7 @@ class TestMessageFiltering:
         db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_duplicate_restart.db"
         first = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=2,
                 leaf_chunk_tokens=10,
@@ -7484,6 +7497,7 @@ class TestMessageFiltering:
 
         second = LCMEngine(
             config=LCMConfig(
+                summary_timeout_ms=0,
                 database_path=str(db_path),
                 fresh_tail_count=2,
                 leaf_chunk_tokens=10,
@@ -22553,6 +22567,7 @@ class TestAssemblyToolPairGuardrail:
         importlib.import_module("hermes_lcm.engine")
 
         config = LCMConfig(
+            summary_timeout_ms=0,
             fresh_tail_count=4,
             database_path=str(tmp_path / "lcm_compress_pair.db"),
             leaf_chunk_tokens=200,
