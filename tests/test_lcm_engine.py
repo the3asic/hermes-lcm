@@ -5674,6 +5674,7 @@ class TestMessageFiltering:
         monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
 
     def _make_engine(self, tmp_path, db_name, **config_kwargs):
+        config_kwargs.setdefault("summary_timeout_ms", 0)
         config = LCMConfig(
             database_path=str(tmp_path / db_name),
             **config_kwargs,
@@ -10008,6 +10009,7 @@ class TestPerTurnIngest:
         must not produce duplicate rows.  The existing cursor dedup ensures
         already-ingested messages are skipped."""
         config = LCMConfig(
+            summary_timeout_ms=0,
             database_path=str(tmp_path / "no-dup.db"),
             fresh_tail_count=2,
             leaf_chunk_tokens=50,
@@ -11487,6 +11489,7 @@ class TestEngineCompress:
 
     def test_dynamic_leaf_chunk_pressure_uses_current_working_window_after_each_pass(self, tmp_path, monkeypatch):
         config = LCMConfig(
+            summary_timeout_ms=0,
             fresh_tail_count=2,
             leaf_chunk_tokens=1,
             dynamic_leaf_chunk_enabled=True,
@@ -21273,6 +21276,7 @@ class TestAssemblyToolPairGuardrail:
 
     def _make_engine(self, tmp_path, db_name="lcm_tool_pairs.db"):
         config = LCMConfig(
+            summary_timeout_ms=0,
             fresh_tail_count=10,
             database_path=str(tmp_path / db_name),
         )
