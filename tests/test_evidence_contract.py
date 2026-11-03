@@ -336,7 +336,9 @@ def test_public_schema_adds_auto_mode_without_changing_default():
         ),
     }
     assert parameters["required"] == ["question", "baseline_refs"]
-    # Dispatch enforces mode/proposal pairing; the wire schema stays flat.
+    # Strict tool-schema validators (Azure OpenAI via Bifrost) reject top-level
+    # combinators (allOf/if-then) with HTTP 400 invalid_function_parameters, so the
+    # wire schema must stay flat; the mode/proposal pairing is enforced at dispatch.
     assert "allOf" not in parameters
     assert "oneOf" not in parameters
     assert "anyOf" not in parameters
