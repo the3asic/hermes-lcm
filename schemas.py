@@ -686,8 +686,12 @@ LCM_COMPILE_EVIDENCE = {
             },
         },
         "required": ["question", "baseline_refs"],
-        # Keep the wire schema flat for providers that reject top-level
-        # combinators. Dispatch still requires a proposal in proposal mode.
+        # NOTE: the conditional "mode=proposal → required: [proposal]" hint previously
+        # lived here as a top-level allOf/if-then. Strict tool-schema validators
+        # (Azure OpenAI gpt-5.6 via Bifrost) reject top-level combinators with
+        # HTTP 400 invalid_function_parameters, killing the whole turn. The runtime
+        # tool handler validates the mode/proposal pairing in Python, so the wire
+        # schema stays flat and the contract is enforced at dispatch.
     },
 }
 

@@ -17,6 +17,11 @@ fork's reviewed release and recovery procedure.
   `lcm_status`; document that this is plugin-side policy reading, not a new
   Hermes Core compaction signal.
 
+### Fixed
+
+- Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
+- Declare the three registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
+
 ## v1.0.0-rc.1 - 2026-09-03
 
 ### Highlights
