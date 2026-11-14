@@ -11,6 +11,9 @@ import pytest
 
 # Collection imports run before fixtures. Isolate them as well as test bodies.
 _host_root = os.environ.get("LCM_HERMES_CORE_ROOT")
+_ordinary_only = os.environ.get("LCM_TEST_ORDINARY_ONLY") == "1"
+if _ordinary_only and _host_root:
+    raise RuntimeError("Ordinary module checks cannot select a Hermes host")
 _collection_home = tempfile.TemporaryDirectory(prefix="lcm-pytest-")
 _original_env = {
     key: value for key, value in os.environ.items()
@@ -49,7 +52,7 @@ if _host_root:
     assert callable(native_anthropic_row_costs) and callable(codex_reasoning_replay_tokens)
     if Path(sys.modules["agent.context_engine"].__file__).resolve() != _host_path / "agent/context_engine.py":
         raise RuntimeError("A different ContextEngine was imported before the real host")
-else:
+elif not _ordinary_only:
     from hermes_lcm.benchmarking.standalone import ensure_agent_context_engine_importable
     ensure_agent_context_engine_importable()
 
@@ -71,3 +74,5 @@ def pytest_sessionfinish(session, exitstatus):
             os.environ.pop(key)
     os.environ.update(_original_env)
     _collection_home.cleanup()
+    if _ordinary_only and "agent.context_engine" in sys.modules:
+        raise RuntimeError("Ordinary module checks imported a ContextEngine host")

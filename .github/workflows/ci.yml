@@ -40,20 +40,68 @@ jobs:
       - name: Lint with ruff
         run: ruff check .
 
-  test:
+  test-ordinary-python:
+    name: Ordinary plugin modules on Python ${{ matrix.python-version }}
     if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
-
+    env:
+      HERMES_HOME: ${{ github.workspace }}/artifacts/ordinary-home
+      HERMES_RUNTIME_DIR: ${{ github.workspace }}/artifacts/tools
+      UV_CACHE_DIR: ${{ github.workspace }}/artifacts/uv-cache
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
+      LCM_TEST_ORDINARY_ONLY: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up the PM interpreter
+        id: pm-python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - name: Set up the ordinary module interpreter
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Check out the dependency manager
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 422ad1861856dd9b80b947fbad9f39d1580f6b41
+          path: artifacts/hermes-core
+      - name: Prepare ordinary module test dependencies through PM
+        working-directory: artifacts/hermes-core
+        env:
+          PM_PYTHON: ${{ steps.pm-python.outputs.python-path }}
+        run: >-
+          "$PM_PYTHON" -m pm.build_env
+          --out "${GITHUB_WORKSPACE}/artifacts/ordinary-env"
+          --python "$(command -v python)"
+          --cache "$UV_CACHE_DIR"
+          --requirement pytest --requirement tiktoken
+      - name: Verify ordinary modules without a ContextEngine host
+        run: |
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/ordinary-env/bin/python"
+          "$PYTHON" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")'
+          "$PYTHON" -m pytest tests/test_chunking.py tests/test_occurrence_time.py tests/test_runtime_time_contract.py -q
+
+  test:
+    name: Real Hermes host on Python 3.14
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      HERMES_HOME: ${{ github.workspace }}/artifacts/dev-home
+      HERMES_RUNTIME_DIR: ${{ github.workspace }}/artifacts/tools
+      UV_CACHE_DIR: ${{ github.workspace }}/artifacts/uv-cache
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up the real host interpreter
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
 
       - name: Check out the observed Hermes host
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,9 +110,23 @@ jobs:
           ref: 422ad1861856dd9b80b947fbad9f39d1580f6b41
           path: artifacts/hermes-core
 
-      - name: Prepare the host-owned test environment
+      - name: Prepare the complete host and test dependency graph through PM
         working-directory: artifacts/hermes-core
-        run: python -m pm.build_env --source . --out .venv --python "$(command -v python)" --group test --group dev --requirement numpy --requirement PyYAML --requirement tiktoken
+        run: >-
+          python -m pm.build_env --source .
+          --out "${GITHUB_WORKSPACE}/artifacts/hermes-host-env"
+          --python "$(command -v python)" --cache "$UV_CACHE_DIR"
+          --group test --group dev
+          --extra anthropic --extra messaging --extra mcp --extra vision --extra pty --extra web
+          --no-install-project
+
+      - name: Prepare LCM dependencies from the real host environment through PM
+        run: >-
+          "${GITHUB_WORKSPACE}/artifacts/hermes-host-env/bin/python"
+          scripts/prepare_release_environment.py
+          --core-root "${GITHUB_WORKSPACE}/artifacts/hermes-core"
+          --out "${GITHUB_WORKSPACE}/artifacts/lcm-test-env"
+          --cache "$UV_CACHE_DIR"
 
       - name: Run isolated regressions with the real host under low file descriptor limit
         env:
@@ -74,7 +136,7 @@ jobs:
           HERMES_HOME: ${{ github.workspace }}/artifacts/dev-home
           TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
         run: |
-          PYTHON="${GITHUB_WORKSPACE}/artifacts/hermes-core/.venv/bin/python"
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/lcm-test-env/bin/python"
           "$PYTHON" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")'
           "$PYTHON" scripts/validate_release_host.py --core-root "$LCM_HERMES_CORE_ROOT"
           ulimit -n 1024
@@ -82,7 +144,7 @@ jobs:
 
       - name: Run static validation
         run: |
-          PYTHON="${GITHUB_WORKSPACE}/artifacts/hermes-core/.venv/bin/python"
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/lcm-test-env/bin/python"
           "$PYTHON" scripts/validate_dependency_contract.py
           "$PYTHON" -m compileall -q -x '/artifacts/' .
           "$PYTHON" -m py_compile scripts/import_lossless_claw.py scripts/validate_release_host.py
