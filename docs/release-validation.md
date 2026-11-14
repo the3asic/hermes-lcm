@@ -7,14 +7,15 @@ Use `scripts/validate_release.sh` as the local release-confidence lane before ta
 Prerequisites:
 
 - Run from the repository checkout.
-- Use a Python environment with `pytest` installed. If `python` on `PATH` is not the intended interpreter, set `PYTHON=/path/to/python`.
-- The benchmark and stress gates are standalone-checkout safe: they provide the minimal Hermes Agent `ContextEngine` base class needed for deterministic local validation when Hermes Agent is not importable.
+- Use the host-owned Python environment with `pytest` and the plugin's enabled dependencies. If `python` on `PATH` is not the intended interpreter, set `PYTHON=/path/to/python`.
+- Set `LCM_HERMES_CORE_ROOT` to the real Core source tree. Release pytest and CI load its actual `ContextEngine` and reasoning helpers. A broken requested host fails during collection.
+- Existing isolated benchmark/stress gates use their standalone development API and synthetic fixtures. Their results describe those legacy checks; they do not certify provider replay, source-event dates, real summary output or production behavior.
 - On a PR branch with `origin/main` available, the whitespace/conflict-marker gate checks `origin/main...HEAD` instead of only uncommitted working-tree changes, then also checks the local working tree and staged diff. Override with `LCM_RELEASE_DIFF_BASE=<rev-or-range>` when validating against another base. If no changed `origin/main...HEAD` range is available but `HEAD` has a parent, the gate checks `HEAD^...HEAD` so a detached release checkout still validates the committed release diff.
 - Python validation runs with `PYTHONPYCACHEPREFIX` under the output directory and pytest cache disabled, then records git status before and after validation so release runs do not silently dirty the checkout.
 - The low-file-descriptor full gate lowers the limit to 1024 only when the current shell allows it; locked-down hosts keep their existing lower limit instead of failing before pytest starts.
 
 ```bash
-scripts/validate_release.sh
+LCM_HERMES_CORE_ROOT=/path/to/core PYTHON=/path/to/host/python scripts/validate_release.sh
 ```
 
 Default smoke mode runs the local gates that should be cheap enough for routine operator use:
@@ -29,10 +30,26 @@ Default smoke mode runs the local gates that should be cheap enough for routine 
 For pre-tag confidence, run:
 
 ```bash
-scripts/validate_release.sh --full
+LCM_HERMES_CORE_ROOT=/path/to/core PYTHON=/path/to/host/python scripts/validate_release.sh --full
 ```
 
 Full mode adds the whole test suite, the low-file-descriptor pytest pass, and the release stress tier. It is intentionally heavier and still avoids provider/network side effects.
+
+## Recorded-host acceptance
+
+Run `scripts/validate_recorded_host.py` with operator-owned real record exports in
+ignored artifacts. It checks native reasoning projection, list/tool-group budgets,
+both recovery entries, actual gateway replay entry building, event-time summary
+publication/condensation, UTC-day selection, mixed-coverage refusal and reopen.
+Its receipt separates missing exact reasoning stamps and unexercised live L1/L2
+outputs. It never calls a provider. An exported prior source snapshot can read
+the offline candidate through `scripts/validate_legacy_reader.py` to demonstrate
+code-version recovery without switching the working checkout.
+
+Review [source event time](source-event-time.md) and [replay budgets](replayed-reasoning-budget.md).
+No historical summary recomputation, production database migration or backfill
+is part of these scripts. A real threshold-triggered compression, host commit,
+subsequent usage and continuation remain separate deployment acceptance.
 
 ## Artifact shape
 

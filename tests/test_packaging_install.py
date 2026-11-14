@@ -149,7 +149,7 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
     assert validate_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
 
 
-def test_validate_release_routes_cache_artifacts_outside_checkout():
+def test_validate_release_uses_task_artifacts_and_real_host_contract():
     repo_root = Path(__file__).resolve().parent.parent
     validate_script = (repo_root / "scripts" / "validate_release.sh").read_text(encoding="utf-8")
 
@@ -159,10 +159,19 @@ def test_validate_release_routes_cache_artifacts_outside_checkout():
     assert "dirty_end=\"$(git status --short" in validate_script
     assert "validation changed git status" in validate_script
     assert "run_pytest()" in validate_script
-    assert "ensure_agent_context_engine_importable()" in validate_script
+    assert 'OUTPUT_DIR="$PWD/artifacts/lcm-release-validation-' in validate_script
+    assert 'run_gate "real host contract" "$PYTHON_BIN" scripts/validate_release_host.py' in validate_script
+    host_check = (repo_root / "scripts" / "validate_release_host.py").read_text(encoding="utf-8")
+    assert "from agent.context_engine import ContextEngine" in host_check
+    assert "from agent.message_sanitization import native_anthropic_row_costs" in host_check
+    assert "from agent.replayed_reasoning import codex_reasoning_replay_tokens" in host_check
+    assert "inspect.getfile(symbol)" in host_check
+    assert 'tiktoken.get_encoding("cl100k_base")' in host_check
+    assert "ensure_agent_context_engine_importable" not in validate_script + host_check
     assert "run_gate \"focused pytest\" run_pytest" in validate_script
     assert "run_gate \"pytest full\" run_pytest" in validate_script
     assert "run_low_fd_pytest" in validate_script
+    assert "run_pytest tests/ -q" in validate_script
     assert "ulimit -n 1024 &&" not in validate_script
 
 

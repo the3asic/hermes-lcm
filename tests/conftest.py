@@ -5,12 +5,15 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-import types
 
 import pytest
 
 
 # Collection imports run before fixtures. Isolate them as well as test bodies.
+_host_root = os.environ.get("LCM_HERMES_CORE_ROOT")
+_ordinary_only = os.environ.get("LCM_TEST_ORDINARY_ONLY") == "1"
+if _ordinary_only and _host_root:
+    raise RuntimeError("Ordinary module checks cannot select a Hermes host")
 _collection_home = tempfile.TemporaryDirectory(prefix="lcm-pytest-")
 _original_env = {
     key: value for key, value in os.environ.items()
@@ -35,15 +38,23 @@ if "hermes_lcm" not in sys.modules:
     )
     sys.modules["hermes_lcm"] = importlib.util.module_from_spec(spec)
 
-# Do not discover a host by guessing parent directory depth. The standalone
-# helper supplies the same base API used by release/benchmark unit runs.
-if "agent" not in sys.modules:
-    agent = types.ModuleType("agent")
-    agent.__path__ = []
-    sys.modules["agent"] = agent
-from hermes_lcm.benchmarking.standalone import ensure_agent_context_engine_importable
-
-ensure_agent_context_engine_importable()
+# An explicit real host takes precedence during collection, before any fixture
+# can install a standalone ABC. A missing or broken requested host fails here.
+if _host_root:
+    _host_path = Path(_host_root).resolve(strict=True)
+    if not (_host_path / "agent/context_engine.py").is_file():
+        raise RuntimeError("LCM_HERMES_CORE_ROOT is not a Hermes Core source tree")
+    sys.path.insert(0, str(_host_path))
+    from agent.context_engine import ContextEngine
+    from agent.message_sanitization import native_anthropic_row_costs
+    from agent.replayed_reasoning import codex_reasoning_replay_tokens
+    assert ContextEngine is not None
+    assert callable(native_anthropic_row_costs) and callable(codex_reasoning_replay_tokens)
+    if Path(sys.modules["agent.context_engine"].__file__).resolve() != _host_path / "agent/context_engine.py":
+        raise RuntimeError("A different ContextEngine was imported before the real host")
+elif not _ordinary_only:
+    from hermes_lcm.benchmarking.standalone import ensure_agent_context_engine_importable
+    ensure_agent_context_engine_importable()
 
 
 @pytest.fixture(autouse=True)
@@ -63,3 +74,5 @@ def pytest_sessionfinish(session, exitstatus):
             os.environ.pop(key)
     os.environ.update(_original_env)
     _collection_home.cleanup()
+    if _ordinary_only and "agent.context_engine" in sys.modules:
+        raise RuntimeError("Ordinary module checks imported a ContextEngine host")

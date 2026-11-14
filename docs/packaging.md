@@ -13,7 +13,7 @@ git clone --branch main https://github.com/the3asic/hermes-lcm \
 
 For profile-specific installs, clone under `~/.hermes/profiles/<profile>/plugins/hermes-lcm`. For development checkouts, `scripts/install.sh` creates a profile-aware symlink into the active Hermes plugin directory and refuses to overwrite an existing checkout or unrelated symlink.
 
-## Why not pip-style packaging yet?
+## Source metadata and discovery
 
 The repository is a Hermes plugin, not a standalone Python application. Runtime discovery currently depends on:
 
@@ -22,7 +22,7 @@ The repository is a Hermes plugin, not a standalone Python application. Runtime 
 - the operator placing or symlinking the checkout into Hermes' plugin search path
 - no plugin-resolved third-party runtime dependencies beyond the host APIs, with optional features such as `tiktoken`, `regex`, NumPy, and FastEmbed supplied by the host environment
 
-There is no `pyproject.toml` or package metadata today, and that is deliberate until Hermes plugin packaging/discovery has a stable target for pip-installed plugins. Adding generic Python packaging before the host install contract is clear would create a second install story without making first-run activation simpler.
+`pyproject.toml` declares a metadata-only member for Hermes PM's uv workspace: the plugin name, a `0.0.0` placeholder version, its Python requirement, and an empty dependency list. It also owns lint settings. The project has no build backend; Hermes discovers the source plugin through `plugin.yaml` and `__init__.py`. Hermes PM owns the Python environment and lock, including the required host APIs in `dependency-contract.json`.
 
 ## Host-owned dependency assurance
 
@@ -49,7 +49,7 @@ Make packaging a separate implementation lane only when one of these is true:
 2. Users need version-pinned installs without direct git checkouts.
 3. Release automation needs packaged artifacts beyond GitHub tags/releases.
 
-The narrow next step would be packaging metadata plus tests that prove a packaged install still exposes `hermes-lcm`, context engine `lcm`, and all 15 LCM tools through `hermes plugins`. Until then, clone/symlink remains the documented path.
+A packaged distribution would need a build and discovery entrypoint plus real installation tests proving that `hermes plugins` discovers `hermes-lcm`, context engine `lcm`, and the tools declared by `plugin.yaml`. The current supported path remains a source checkout or development symlink.
 
 ## Current install and update references
 

@@ -35,7 +35,7 @@ def test_dependency_contract_validator_accepts_repository():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.6" in result.stdout
+    assert "dependency contract valid: version 1.1.0" in result.stdout
     assert "11 external imports declared" in result.stdout
 
 
@@ -940,7 +940,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.6"
+    assert contract["contract_version"] == "1.1.0"
     assert contract["boundary"] == "host-owned"
     assert contract["imported_api_validation"] == "observed-coverage-only"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"
@@ -995,9 +995,34 @@ def test_dependency_contract_validation_is_wired_into_ci_and_release_gate():
         REPO_ROOT / "scripts" / "validate_release.sh"
     ).read_text(encoding="utf-8")
 
-    assert "python scripts/validate_dependency_contract.py" in ci_workflow
+    assert '"$PYTHON" scripts/validate_dependency_contract.py' in ci_workflow
     assert (
         'run_gate "dependency contract" "$PYTHON_BIN" '
         "scripts/validate_dependency_contract.py --report-environment"
         in release_validator
     )
+
+
+def test_real_host_ci_builds_the_project_graph_before_lcm_requirements():
+    import yaml
+
+    workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    native = workflow["jobs"]["test"]
+    assert "strategy" not in native
+    setup = next(step for step in native["steps"]
+                 if step.get("name") == "Set up the real host interpreter")
+    assert setup["with"]["python-version"] == "3.14"
+    project = next(step for step in native["steps"]
+                   if "complete host" in step.get("name", ""))
+    assert "--group test --group dev" in project["run"]
+    assert "--requirement" not in project["run"]
+    overlay = next(step for step in native["steps"]
+                   if "LCM dependencies" in step.get("name", ""))
+    assert "scripts/prepare_release_environment.py" in overlay["run"]
+    assert "hermes-host-env/bin/python" in overlay["run"]
+    ordinary = workflow["jobs"]["test-ordinary-python"]
+    assert ordinary["strategy"]["matrix"]["python-version"] == ["3.11", "3.12", "3.13", "3.14"]
+    assert ordinary["env"]["LCM_TEST_ORDINARY_ONLY"] == "1"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -22,8 +23,9 @@ Options:
   -h, --help    Show this help.
 
 Environment:
-  PYTHON=/path/to/python  Python interpreter to use for all Python gates.
-                          It must have pytest available.
+  PYTHON=/path/to/python  Host-owned interpreter with pytest, numpy and tiktoken.
+  TIKTOKEN_CACHE_DIR=/path/to/cache  Primed offline cl100k_base cache.
+  LCM_HERMES_CORE_ROOT=/path/to/core  Real Hermes Core source tree.
 EOF
 }
 
@@ -33,13 +35,8 @@ Release validation prerequisite failed: $1
 
 Using Python: $PYTHON_BIN
 
-Fix:
-  - activate a Python environment with pytest installed, or
-  - run with PYTHON=/path/to/python $0 [--full]
-
-Examples:
-  python -m pip install pytest
-  PYTHON=/path/to/venv/bin/python scripts/validate_release.sh --full
+Prepare pytest through the Hermes host's dependency manager, then use:
+  LCM_HERMES_CORE_ROOT=/path/to/core PYTHON=/path/to/host/python $0 [--full]
 EOF
   exit 2
 }
@@ -94,7 +91,7 @@ fi
 require_python_module "pytest" "pytest validation gates"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
-  OUTPUT_DIR="/tmp/hermes-lcm-release-validation-$(date -u +%Y%m%d-%H%M%S)"
+  OUTPUT_DIR="$PWD/artifacts/lcm-release-validation-$(date -u +%Y%m%d-%H%M%S)-$$"
 fi
 
 if [[ -e "$OUTPUT_DIR" ]]; then
@@ -108,6 +105,8 @@ CHECKLIST="$OUTPUT_DIR/validation-checklist.md"
 FAILURES=()
 
 export PYTHONPYCACHEPREFIX="$OUTPUT_DIR/pycache"
+export HERMES_HOME="${HERMES_HOME:-$OUTPUT_DIR/dev-home}"
+export HERMES_DISABLE_LAZY_INSTALLS=1
 if [[ -n "${PYTEST_ADDOPTS:-}" ]]; then
   export PYTEST_ADDOPTS="-p no:cacheprovider $PYTEST_ADDOPTS"
 else
@@ -117,7 +116,7 @@ fi
 cd "$REPO_ROOT"
 
 branch="$(git branch --show-current 2>/dev/null || true)"
-commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
+commit="$(git rev-parse HEAD 2>/dev/null || true)"
 dirty_start="$(git status --short 2>/dev/null || true)"
 DIFF_CHECK_RANGE="${LCM_RELEASE_DIFF_BASE:-}"
 if [[ -z "$DIFF_CHECK_RANGE" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -136,8 +135,11 @@ cat > "$CHECKLIST" <<EOF
 - repo: ${branch:-detached}@${commit:-unknown}
 - diff_check_range: ${DIFF_CHECK_RANGE:-working-tree}
 - output_dir: $OUTPUT_DIR
+- hermes_home: $HERMES_HOME
+- validation_scope: isolated regressions and synthetic benchmark/stress coverage
 - provider_network_side_effects: none expected
 - live_profile_mutations: none expected
+- real_recording_and_database_acceptance: separate operator-owned validation
 
 ## Gates
 EOF
@@ -175,25 +177,26 @@ run_gate() {
   fi
 }
 
+
 run_pytest() {
-  "$PYTHON_BIN" - "$@" <<'PY'
-import sys
-from benchmarking.standalone import ensure_agent_context_engine_importable
-ensure_agent_context_engine_importable()
-import pytest
-raise SystemExit(pytest.main(sys.argv[1:]))
-PY
+  "$PYTHON_BIN" -m pytest "$@"
 }
 
 run_low_fd_pytest() {
   local current_limit
   current_limit="$(ulimit -n 2>/dev/null || true)"
   if [[ "$current_limit" == "unlimited" ]]; then
-    ulimit -n 1024 2>/dev/null || echo "warning: could not lower file descriptor limit from unlimited to 1024" >&2
+    ulimit -n 1024 || return 2
   elif [[ "$current_limit" =~ ^[0-9]+$ ]] && (( current_limit > 1024 )); then
-    ulimit -n 1024 2>/dev/null || echo "warning: could not lower file descriptor limit from $current_limit to 1024" >&2
+    ulimit -n 1024 || return 2
   fi
-  run_pytest -q
+  current_limit="$(ulimit -n)"
+  if ! [[ "$current_limit" =~ ^[0-9]+$ ]] || (( current_limit > 1024 )); then
+    echo "Cannot verify a file descriptor limit of at most 1024: $current_limit" >&2
+    return 2
+  fi
+  printf 'file_descriptor_limit=%s\n' "$current_limit"
+  run_pytest tests/ -q
 }
 
 if [[ -n "$DIFF_CHECK_RANGE" ]]; then
@@ -205,16 +208,23 @@ if [[ -n "$DIFF_CHECK_RANGE" ]]; then
 else
   run_gate "git diff check" git diff --check
 fi
+# Release gates require a real source host. Standalone unit/benchmark ABCs
+# remain available for isolated development, but cannot certify replay budgets.
+: "${LCM_HERMES_CORE_ROOT:?Set LCM_HERMES_CORE_ROOT to the Hermes Core source tree}"
+export PYTHONPATH="$LCM_HERMES_CORE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HERMES_LCM_HOST_ROOT="$LCM_HERMES_CORE_ROOT"
+run_gate "real host contract" "$PYTHON_BIN" scripts/validate_release_host.py --core-root "$LCM_HERMES_CORE_ROOT"
+
 run_gate "dependency contract" "$PYTHON_BIN" scripts/validate_dependency_contract.py --report-environment
-run_gate "python compileall" "$PYTHON_BIN" -m compileall -q .
-run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/backfill_externalized_tool_outputs.py scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py scripts/validate_dependency_contract.py
+run_gate "python compileall" "$PYTHON_BIN" -m compileall -q -x '(^|/)(artifacts|\.git|\.venv|venv)/' .
+run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/backfill_externalized_tool_outputs.py scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py scripts/validate_dependency_contract.py scripts/validate_release_host.py
 run_gate "shell syntax" bash -n scripts/install.sh scripts/update.sh scripts/validate_release.sh
 run_gate "focused pytest" run_pytest tests/test_lcm_core.py tests/test_lcm_command.py tests/test_packaging_install.py tests/test_benchmarking_cli.py tests/test_stress_release_check.py tests/test_historical_externalization_backfill.py -q
 run_gate "benchmark smoke" "$PYTHON_BIN" scripts/lcm_benchmark.py --synthetic-fixture release_validation_smoke:2:1:3 --policy benchmarks/policies/pressure_smoke.yaml --output "$OUTPUT_DIR/benchmark-smoke" --allow-external-output --json
 run_gate "stress smoke" "$PYTHON_BIN" scripts/lcm_stress_check.py --output "$OUTPUT_DIR/stress-smoke" --tier smoke --json
 
 if [[ "$MODE" == "full" ]]; then
-  run_gate "pytest full" run_pytest -q
+  run_gate "pytest full" run_pytest tests/ -q
   run_gate "pytest low fd" run_low_fd_pytest
   run_gate "stress release" "$PYTHON_BIN" scripts/lcm_stress_check.py --output "$OUTPUT_DIR/stress-release" --tier release --json
 fi
@@ -265,7 +275,7 @@ cat >> "$CHECKLIST" <<'EOF'
 
 ## Result
 
-PASS: all selected release-validation gates passed.
+PASS: all selected isolated regression gates passed. Real recording and full-database acceptance remain separate requirements.
 
 Recommended next release-confidence step: review the generated checklist and scrubbed benchmark/stress artifacts, then run `scripts/validate_release.sh --full` before tagging if this was a smoke run.
 EOF

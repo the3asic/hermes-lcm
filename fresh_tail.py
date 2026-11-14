@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Sequence
 
 from .message_analysis import _tool_call_id
-from .tokens import count_message_tokens, count_messages_tokens
+from .tokens import count_messages_tokens
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,7 @@ def resolve_fresh_tail_boundary(
     *,
     fresh_tail_count: int,
     fresh_tail_max_tokens: int = 0,
+    api_mode: str | None = None,
 ) -> FreshTailBoundary:
     """Resolve the protected suffix without splitting assistant/tool groups.
 
@@ -75,15 +76,16 @@ def resolve_fresh_tail_boundary(
     token_limited = False
 
     if token_limit > 0:
-        used = 0
         token_start = message_count - 1
+        payload_cache = {}
         for index in range(message_count - 1, count_start - 1, -1):
-            message_tokens = count_message_tokens(messages[index])
-            if index != message_count - 1 and used + message_tokens > token_limit:
+            # Signed thinking can be dropped/demoted by adjacent assistant rows
+            # or missing tool results. Price the candidate suffix as a list.
+            candidate_tokens = count_messages_tokens(list(messages[index:]), api_mode=api_mode, _payload_cache=payload_cache)
+            if index != message_count - 1 and candidate_tokens > token_limit:
                 token_limited = True
                 break
             token_start = index
-            used += message_tokens
         start = token_start
 
     group_start = _assistant_group_start(messages, start)
@@ -93,7 +95,7 @@ def resolve_fresh_tail_boundary(
     return FreshTailBoundary(
         start=start,
         count=len(tail),
-        tokens=count_messages_tokens(tail),
+        tokens=count_messages_tokens(tail, api_mode=api_mode),
         count_limit=count_limit,
         token_limit=token_limit,
         token_limited=token_limited,

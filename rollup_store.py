@@ -1,7 +1,7 @@
 """SQLite-backed storage for derived temporal summary rollups.
 
-This module is intentionally not wired into the LCM engine yet. It provides
-only the durable schema-facing operations used by later temporal-memory work.
+The engine uses this store for optional derived daily, weekly and monthly
+rollups. Event-time certification is separate from legacy storage-time rows.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from .db_bootstrap import (
     verify_temporal_rollup_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
+from .event_time import ensure_event_time_schema, read_event_time
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ class RollupStore:
                     "temporal rollup schema incomplete after ensure: "
                     + ", ".join(missing)
                 )
+        ensure_event_time_schema(self._conn)
         mark_migration_step_complete(self._conn, "temporal_rollups_v1")
         self._conn.commit()
 
@@ -135,6 +137,10 @@ class RollupStore:
             "status": row["status"],
             "built_at": row["built_at"],
             "source_fingerprint": row["source_fingerprint"],
+            "time_basis": "observed_at_v1" if self._conn.execute(
+                "SELECT 1 FROM lcm_rollup_event_time WHERE rollup_id=? AND source_fingerprint=?",
+                (rollup_id, row["source_fingerprint"]),
+            ).fetchone() else "legacy_storage",
             "error": row["error"],
             "generation": int(row["generation"] or 0),
             "source_node_ids": [int(source_row["node_id"]) for source_row in source_rows],
@@ -220,6 +226,8 @@ class RollupStore:
         token_count: int,
         source_node_ids: Sequence[int],
         fingerprint: str,
+        *,
+        time_basis: str = "legacy_storage",
     ) -> bool:
         """Publish a completed build iff it was not superseded.
 
@@ -235,8 +243,14 @@ class RollupStore:
         ``generation``, so the status clause is what stops a late ``mark_failed``
         from the same token flipping a just-published row.
         """
+        if time_basis not in {"legacy_storage", "observed_at_v1"}:
+            raise ValueError("Unsupported rollup time basis")
         unique_source_ids = list(dict.fromkeys(int(node_id) for node_id in source_node_ids))
         with self._write_transaction():
+            if time_basis == "observed_at_v1" and (
+                not unique_source_ids or any(not read_event_time(self._conn, node_id).complete for node_id in unique_source_ids)
+            ):
+                raise ValueError("Cannot certify a rollup with incomplete source event time")
             owned = self._conn.execute(
                 """
                 SELECT period_kind, period_start, scope FROM lcm_rollups
@@ -377,6 +391,12 @@ class RollupStore:
                 "INSERT INTO lcm_rollup_sources(rollup_id, node_id) VALUES(?, ?)",
                 ((int(token.rollup_id), node_id) for node_id in unique_source_ids),
             )
+            self._conn.execute("DELETE FROM lcm_rollup_event_time WHERE rollup_id=?", (int(token.rollup_id),))
+            if time_basis == "observed_at_v1":
+                self._conn.execute(
+                    "INSERT INTO lcm_rollup_event_time VALUES (?, ?)",
+                    (int(token.rollup_id), fingerprint),
+                )
         return True
 
     def mark_failed(self, token: RollupBuildToken, error: str) -> bool:

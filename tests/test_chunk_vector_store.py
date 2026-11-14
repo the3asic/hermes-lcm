@@ -104,13 +104,17 @@ class TestChunkWriteAndKnn:
         )
         assert {row[0] for row in result} == {"12:0"}
 
-    def test_recency_window(self, store):
+    def test_recency_window_excludes_unknown_source_event_dates(self, store):
         _write(store, "10:0", 10, 0, [1.0, 0.0, 0.0, 0.0])
         _write(store, "12:0", 12, 0, [1.0, 0.0, 0.0, 0.0])
         result = store.knn_chunks(
             [1.0, 0.0, 0.0, 0.0], k=5, model=MODEL, provider=PROVIDER, since=250.0,
         )
-        assert {row[0] for row in result} == {"12:0"}
+        assert list(result) == []
+        unfiltered = store.knn_chunks(
+            [1.0, 0.0, 0.0, 0.0], k=5, model=MODEL, provider=PROVIDER,
+        )
+        assert {row[0] for row in unfiltered} == {"10:0", "12:0"}
 
     def test_bounded_coverage(self, tmp_path):
         db_path = tmp_path / "lcm.db"

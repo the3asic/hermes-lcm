@@ -781,7 +781,7 @@ def test_suppressed_summaries_are_filtered_and_purge_removes_embeddings(stores):
     ).fetchone()[0] == 0
 
 
-def test_filter_overfetch_uses_summary_time_and_session_columns(stores):
+def test_time_filter_excludes_summaries_without_source_event_dates(stores):
     dag, store = stores
     old_a = _add_summary(dag, session_id="conversation-a", created_at=10.0)
     new_a = _add_summary(dag, session_id="conversation-a", created_at=20.0)
@@ -798,7 +798,14 @@ def test_filter_overfetch_uses_summary_time_and_session_columns(stores):
         since=15.0,
         conversation_ids=["conversation-a"],
     )
-    assert [row[0] for row in result] == [str(new_a)]
+    assert list(result) == []
+    unfiltered = store.knn(
+        [1.0, 0.0, 0.0], k=3, model="filters",
+        conversation_ids=["conversation-a"],
+    )
+    assert {row[0] for row in unfiltered} == {str(old_a), str(new_a)}
+    assert all(dag.get_node(node_id).event_time.known_count == 0
+               for node_id in (old_a, new_a, new_b))
 
 
 def test_filters_are_applied_before_score_top_k_truncation(stores):
@@ -866,11 +873,11 @@ def test_matrix_cache_is_invalidated_on_write(stores):
     assert updated[0][0] == str(second)
 
 
-def test_time_to_filter_excludes_before_top_k(stores):
+def test_time_to_filter_excludes_unknown_event_dates_before_top_k(stores):
     pytest.importorskip("numpy")
     dag, store = stores
     store.register_profile("time-to", "local", 2)
-    # 501 high-scoring but too-new vectors must not consume the top-k slots.
+    # Storage/creation dates do not establish event dates for any vector.
     for index in range(501):
         too_new = _add_summary(dag, created_at=10_000.0 + index)
         _record_embedding(store, too_new, "summary", "time-to", [1.0, 0.0])
@@ -878,8 +885,11 @@ def test_time_to_filter_excludes_before_top_k(stores):
     _record_embedding(store, eligible, "summary", "time-to", [0.0, 1.0])
 
     result = store.knn([1.0, 0.0], k=2, model="time-to", until=100.0)
-    assert result.coverage == "full"
-    assert [row[0] for row in result] == [str(eligible)]
+    assert result.coverage == "none"
+    assert list(result) == []
+    unfiltered = store.knn([0.0, 1.0], k=1, model="time-to")
+    assert [row[0] for row in unfiltered] == [str(eligible)]
+    assert dag.get_node(eligible).event_time.known_count == 0
 
 
 def test_source_filter_enforced_before_top_k(stores):

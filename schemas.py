@@ -113,14 +113,14 @@ LCM_GREP = {
             "time_from": {
                 "anyOf": [{"type": "number"}, {"type": "string"}],
                 "description": (
-                    "Optional inclusive minimum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
+                    "Optional inclusive minimum source-event timestamp; unknown event dates are excluded. Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
                 ),
             },
             "time_to": {
                 "anyOf": [{"type": "number"}, {"type": "string"}],
                 "description": (
-                    "Optional inclusive maximum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
+                    "Optional inclusive maximum source-event timestamp; unknown event dates are excluded. Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
                 ),
             },
@@ -885,7 +885,8 @@ LCM_RECENT = {
     "description": (
         "Retrieve recent conversation summaries by a natural UTC time period. "
         "Ready temporal rollups are served when available; otherwise the tool "
-        "transparently falls back to existing leaf summaries in the same window."
+        "returns source summaries in the same event-time window. Unknown event dates are "
+        "excluded and mixed coverage is identified; import dates do not establish event dates."
     ),
     "parameters": {
         "type": "object",
@@ -964,11 +965,11 @@ LCM_LOAD_SESSION = {
             },
             "time_from": {
                 "type": "number",
-                "description": "Optional inclusive minimum message timestamp (Unix seconds).",
+                "description": "Optional inclusive minimum source-event timestamp (Unix seconds); unknown event dates are excluded.",
             },
             "time_to": {
                 "type": "number",
-                "description": "Optional inclusive maximum message timestamp (Unix seconds).",
+                "description": "Optional inclusive maximum source-event timestamp (Unix seconds); unknown event dates are excluded.",
             },
             "include_exact_ref": {
                 "type": "boolean",

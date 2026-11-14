@@ -460,10 +460,16 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
         if not set(expected).issubset(actual) or not actual.issubset(set(expected) | optional):
             return VERSION_MISMATCH_GENUINELY_NEWER
 
+    # Additive event-time side tables preserve the v5 core column contract.
+    # Only their exact declared shapes qualify for an interim-stamp repair.
+    from .event_time import EVENT_TIME_TABLE_COLUMNS, verify_event_time_columns
+    if not verify_event_time_columns(conn):
+        return VERSION_MISMATCH_GENUINELY_NEWER
+
     # Any extra table must belong to a known feature family or be an FTS5 shadow.
     # The feature table's *internal* shape is intentionally NOT checked here — an
     # early-variant feature table is still an interim stamp, repaired on apply.
-    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY)
+    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY) | set(EVENT_TIME_TABLE_COLUMNS)
     for fts in _V5_CORE_PRESENCE_ONLY:
         allowed.update(get_fts_shadow_table_names(fts))
     for table in tables:
@@ -526,10 +532,13 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
         tables = _user_table_names(conn)
     except sqlite3.DatabaseError:
         return []
+    from .event_time import EVENT_TIME_TABLE_COLUMNS, ROLLUP_EVENT_TIME_TRIGGERS, verify_event_time_columns
+    if not verify_event_time_columns(conn):
+        raise RuntimeError("Unrecognized event-time schema cannot be remediated")
     plans: list[dict[str, object]] = []
     for family in _INTERIM_FEATURE_FAMILIES:
         prefix = family["prefix"]
-        present = sorted(t for t in tables if t.startswith(prefix))
+        present = sorted(t for t in tables if t.startswith(prefix) and t not in EVENT_TIME_TABLE_COLUMNS)
         if not present:
             continue
         verify = _family_verifier(prefix)
@@ -551,6 +560,13 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
                 (prefix + "%",),
             ).fetchall()
         )
+        if prefix == "lcm_rollup":
+            triggers = sorted(set(triggers) | {
+                str(row[0]) for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN (?, ?, ?)",
+                    ROLLUP_EVENT_TIME_TRIGGERS,
+                ).fetchall()
+            })
         plans.append({
             "family": family["name"],
             "tables": present,

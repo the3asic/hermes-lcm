@@ -64,6 +64,9 @@ def test_register():
         "HERMES_HOME": str(tmp_path / "production-home"),
         "PYTHONPATH": str(host), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
     })
+    explicit_host = os.environ.get("HERMES_LCM_HOST_ROOT")
+    if explicit_host:
+        env["LCM_HERMES_CORE_ROOT"] = explicit_host
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          "--basetemp", str(tmp_path / "child-temp"), str(probe)],

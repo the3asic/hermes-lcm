@@ -1618,8 +1618,11 @@ class TestEscalationStripReasoning:
             envelope = json.loads(messages[1]["content"])
             assert envelope["operation"] == "lcm_summary_l1"
             bounded_source = envelope["sources"][0]
-            original_source = adversarial + "\n\n---\n\n" + second_summary
-            assert bounded_source["content"].startswith(adversarial[:12])
+            original_source = (
+                f"[Summary node {first_node_id}, depth 0]\n{adversarial}"
+                f"\n\n---\n\n[Summary node {second_node_id}, depth 0]\n{second_summary}"
+            )
+            assert bounded_source["content"].startswith(original_source[:12])
             assert bounded_source["content"].endswith(second_summary[-16:])
             assert bounded_source["content_truncated"] is True
             assert bounded_source["original_content_chars"] == len(original_source)
@@ -1628,6 +1631,12 @@ class TestEscalationStripReasoning:
                 "source_type": "summary_nodes",
                 "node_ids": [first_node_id, second_node_id],
                 "source_depth": 0,
+                "source_event_times": [
+                    {"node_id": node_id, "earliest_at": None, "latest_at": None,
+                     "known_count": 0, "unknown_count": 1, "legacy_count": 0,
+                     "basis": "observed_at", "status": "unknown"}
+                    for node_id in (first_node_id, second_node_id)
+                ],
             }
             persisted = [
                 node for node in second._dag.get_session_nodes(session_id)
@@ -12931,6 +12940,12 @@ class TestSessionRollover:
                 "expand_hint": "",
                 "earliest_at": None,
                 "latest_at": None,
+                "storage_time_basis": "ingested_at",
+                "event_time": {
+                    "earliest_at": None, "latest_at": None,
+                    "known_count": 0, "unknown_count": 1, "legacy_count": 0,
+                    "basis": "observed_at", "status": "unknown",
+                },
                 "from_current_session": True,
             }
         ]
@@ -21310,8 +21325,8 @@ class TestAssemblyGuardrails:
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
             lcm_engine_module,
-            "count_message_tokens",
-            lambda msg: len(msg.get("content", "")),
+            "count_messages_tokens",
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         result = instance._assemble_context(
@@ -21341,8 +21356,8 @@ class TestAssemblyGuardrails:
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
             lcm_engine_module,
-            "count_message_tokens",
-            lambda msg: len(msg.get("content", "")),
+            "count_messages_tokens",
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         result = instance._assemble_context(
@@ -21371,8 +21386,8 @@ class TestAssemblyGuardrails:
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
             lcm_engine_module,
-            "count_message_tokens",
-            lambda msg: len(msg.get("content", "")),
+            "count_messages_tokens",
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         result = instance._assemble_context(
@@ -21451,8 +21466,8 @@ class TestAssemblyGuardrails:
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
             lcm_engine_module,
-            "count_message_tokens",
-            lambda msg: len(msg.get("content", "")),
+            "count_messages_tokens",
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         result = instance._assemble_context(
@@ -21490,7 +21505,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
         monkeypatch.setattr(lcm_engine_module, "count_tokens", lambda text: len(text))
         monkeypatch.setattr(
@@ -21549,7 +21564,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
         monkeypatch.setattr(lcm_engine_module, "count_tokens", lambda text: len(text))
         monkeypatch.setattr(
@@ -21594,7 +21609,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         messages = [
@@ -21636,7 +21651,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         messages = [
@@ -21672,7 +21687,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         node = SummaryNode(
@@ -21725,7 +21740,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         messages = [
@@ -21761,7 +21776,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
         monkeypatch.setattr(lcm_engine_module, "count_tokens", lambda text: len(text))
         monkeypatch.setattr(
@@ -21811,7 +21826,7 @@ class TestAssemblyGuardrails:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+            lambda messages, **_kwargs: sum(len(msg.get("content", "")) for msg in messages),
         )
 
         messages = [
@@ -21962,7 +21977,7 @@ class TestAssemblyToolPairGuardrail:
         monkeypatch.setattr(
             lcm_engine_module,
             "count_messages_tokens",
-            lambda messages: sum(len(str(msg.get("content", ""))) for msg in messages),
+            lambda messages, **_kwargs: sum(len(str(msg.get("content", ""))) for msg in messages),
         )
 
         config = LCMConfig(
@@ -22863,21 +22878,15 @@ class TestEngineTools:
     def test_handle_grep_time_filter_pushes_into_message_search(self, engine):
         older_id = engine._store.append(
             "test-session",
-            {"role": "assistant", "content": "docker older assistant"},
+            {"role": "assistant", "content": "docker older assistant", "timestamp": 1000.0},
         )
-        engine._store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1000.0, older_id),
-        )
+
         for idx in range(25):
-            store_id = engine._store.append(
+            engine._store.append(
                 "test-session",
-                {"role": "user", "content": f"docker newer user {idx}"},
+                {"role": "user", "content": f"docker newer user {idx}", "timestamp": 2000.0 + idx},
             )
-            engine._store._conn.execute(
-                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-                (2000.0 + idx, store_id),
-            )
+
         engine._store._conn.commit()
 
         result = json.loads(engine.handle_tool_call(
@@ -22888,6 +22897,7 @@ class TestEngineTools:
         assert result["time_to"] == 1500.0
         assert result["total_results"] == 1
         assert result["results"][0]["timestamp"] == 1000.0
+        assert result["results"][0]["store_id"] == older_id
         assert "older assistant" in result["results"][0]["snippet"]
 
     def test_handle_grep_sanitizes_period_in_unquoted_fts_query(self, engine):
@@ -23081,21 +23091,15 @@ class TestEngineTools:
     def test_handle_grep_like_fallback_applies_time_filter_before_limit(self, engine):
         older_id = engine._store.append(
             "test-session",
-            {"role": "assistant", "content": "docker-compose older assistant"},
+            {"role": "assistant", "content": "docker-compose older assistant", "timestamp": 1000.0},
         )
-        engine._store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1000.0, older_id),
-        )
+
         for idx in range(25):
-            store_id = engine._store.append(
+            engine._store.append(
                 "test-session",
-                {"role": "user", "content": f"docker-compose newer user {idx}"},
+                {"role": "user", "content": f"docker-compose newer user {idx}", "timestamp": 2000.0 + idx},
             )
-            engine._store._conn.execute(
-                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-                (2000.0 + idx, store_id),
-            )
+
         engine._store._conn.commit()
 
         result = json.loads(engine.handle_tool_call(
@@ -23106,17 +23110,15 @@ class TestEngineTools:
         assert result["time_to"] == 1500.0
         assert result["total_results"] == 1
         assert result["results"][0]["timestamp"] == 1000.0
+        assert result["results"][0]["store_id"] == older_id
         assert "older assistant" in result["results"][0]["snippet"]
 
     def test_handle_grep_accepts_timezone_aware_iso_time_filter(self, engine):
         store_id = engine._store.append(
             "test-session",
-            {"role": "user", "content": "docker timezone aware"},
+            {"role": "user", "content": "docker timezone aware", "timestamp": 1_700_000_000.0},
         )
-        engine._store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_700_000_000.0, store_id),
-        )
+
         engine._store._conn.commit()
 
         result = json.loads(engine.handle_tool_call(
@@ -23436,7 +23438,8 @@ class TestEngineTools:
         assert result["total_results"] == 2
         assert len(result["results"]) == 1
         assert result["results"][0]["type"] == "summary"
-        assert "newer discord summary" in result["results"][0]["snippet"]
+        assert "older discord summary" in result["results"][0]["snippet"]
+        assert result["results"][0]["event_time"]["status"] == "unknown"
 
     def test_handle_grep_unknown_source_filter_matches_unknown_messages_and_summaries(self, engine):
         unknown_store_id = engine._store.append(
@@ -23935,18 +23938,15 @@ class TestEngineTools:
         current_ids = [
             engine._store.append(
                 "test-session",
-                {"role": "assistant", "content": "vendoring external"},
+                {"role": "assistant", "content": "vendoring external", "timestamp": now},
             )
             for _ in range(20)
         ]
         future_id = engine._store.append(
             "test-session",
-            {"role": "assistant", "content": "vendoring external"},
+            {"role": "assistant", "content": "vendoring external", "timestamp": future},
         )
-        for current_id in current_ids:
-            engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (now, current_id))
-        engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (future, future_id))
-        engine._store._conn.commit()
+        assert len(current_ids) == 20
 
         store_results = engine._store.search("vendoring external", session_id="test-session", limit=1, sort="hybrid")
         result = json.loads(
@@ -26684,7 +26684,10 @@ class TestHandleGrepCrossSession:
             assert "from_current_session" in hit
             assert hit["from_current_session"] == (hit["session_id"] == "test-session")
             assert "timestamp" in hit
-            assert hit["timestamp"] >= 0
+            assert hit["timestamp"] is None
+            assert hit["observed_at"] is None
+            assert hit["ingested_at"] >= 0
+            assert hit["time_status"] == "unknown"
 
     def test_session_scope_session_restricts_to_explicit_id(self, engine):
         self._seed_two_sessions(engine)
@@ -27568,7 +27571,11 @@ class TestHandleGrepExternalizedPayloads:
             )
         )
 
-        expected_store_ids = [raw_store_id] if content_scope == "both" else []
+        expected_store_ids = (
+            [raw_store_id]
+            if content_scope == "both" and filter_name not in {"time_from", "time_to"}
+            else []
+        )
         assert [item["store_id"] for item in result["results"]] == expected_store_ids, filter_name
         assert result["externalized_results_omitted"] is True
         assert "externalized_scan" not in result
@@ -27757,12 +27764,8 @@ class TestHandleLoadSession:
         for role, content, source, timestamp in rows:
             store_id = engine._store.append(
                 "old-session",
-                {"role": role, "content": content, "tool_call_id": "call_x" if role == "tool" else None},
+                {"role": role, "content": content, "timestamp": timestamp, "tool_call_id": "call_x" if role == "tool" else None},
                 source=source,
-            )
-            engine._store._conn.execute(
-                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-                (timestamp, store_id),
             )
             store_ids.append(store_id)
         engine._store._conn.commit()

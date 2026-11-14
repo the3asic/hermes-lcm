@@ -193,8 +193,13 @@ def test_permission_helpers_tighten_loose_database_without_releasing_sqlite_lock
         held.close()
 
 
-def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path):
+@pytest.mark.parametrize("journal_state", ["fresh", "existing-wal"])
+def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path, journal_state):
     db_path = tmp_path / "database" / "lcm.db"
+    if journal_state == "existing-wal":
+        db_path.parent.mkdir(mode=0o700)
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
 
     with _process_umask(0o022):
         store = MessageStore(db_path)
@@ -203,8 +208,12 @@ def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp
             store.commit()
 
             assert _mode(db_path.parent) == 0o700
-            assert db_path.with_name(db_path.name + "-wal").exists()
-            assert db_path.with_name(db_path.name + "-shm").exists()
+            mode = store.connection.execute("PRAGMA journal_mode").fetchone()[0]
+            assert mode in {"wal", "delete"}
+            if journal_state == "existing-wal":
+                assert mode == "wal"
+            assert db_path.with_name(db_path.name + "-wal").exists() == (mode == "wal")
+            assert db_path.with_name(db_path.name + "-shm").exists() == (mode == "wal")
             _assert_private_sqlite_artifacts(db_path)
         finally:
             store.close()
@@ -323,6 +332,7 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-wal")
     sidecar.write_text("replace me", encoding="utf-8")
+    sidecar.chmod(0o644)
     target = tmp_path / "unrelated.txt"
     target.write_text("shared", encoding="utf-8")
     target.chmod(0o644)
@@ -395,6 +405,7 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
+    journal.chmod(0o644)
     real_open = os.open
     disappeared = False
 
@@ -426,6 +437,7 @@ def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
+    journal.chmod(0o644)
     real_open = os.open
     unlinked = False
 

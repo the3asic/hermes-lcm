@@ -648,7 +648,8 @@ def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path
 
     conn = sqlite3.connect(target_db)
     rows = conn.execute(
-        """SELECT session_id, source, role, content, timestamp, token_estimate
+        """SELECT session_id, source, role, content, timestamp, token_estimate,
+                  observed_at, observed_at_source, ingested_at
            FROM messages WHERE source != 'existing-source' ORDER BY store_id"""
     ).fetchall()
     conn.close()
@@ -660,6 +661,9 @@ def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path
     assert rows[0][3] == "hello from old OpenClaw"
     assert rows[0][4] == pytest.approx(1776686401.0)
     assert rows[0][5] > 0
+    assert [row[6] for row in rows] == pytest.approx([1776686401.0, 1776686402.0])
+    assert all(row[7] == "lossless_claw_message_created_at_utc" for row in rows)
+    assert all(row[8] > row[6] for row in rows)
 
     searchable = MessageStore(target_db).search("old OpenClaw", session_id=None, limit=5)
     assert [row["content"] for row in searchable] == [

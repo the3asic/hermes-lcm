@@ -5,13 +5,25 @@ on:
     branches: [main, "abm/native-portability-*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      core_repository:
+        description: Hermes Core repository for the native-host checks
+        required: true
+        default: NousResearch/hermes-agent
+        type: string
+      core_ref:
+        description: Exact Core revision for the native-host checks
+        required: true
+        default: 422ad1861856dd9b80b947fbad9f39d1580f6b41
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   workflow-lint:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -24,7 +36,7 @@ jobs:
           "$(go env GOPATH)"/bin/actionlint
 
   lint:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -40,68 +52,119 @@ jobs:
       - name: Lint with ruff
         run: ruff check .
 
-  test:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+  test-ordinary-python:
+    name: Ordinary plugin modules on Python ${{ matrix.python-version }}
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
-
+    env:
+      HERMES_HOME: ${{ github.workspace }}/artifacts/ordinary-home
+      HERMES_RUNTIME_DIR: ${{ github.workspace }}/artifacts/tools
+      UV_CACHE_DIR: ${{ github.workspace }}/artifacts/uv-cache
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
+      LCM_TEST_ORDINARY_ONLY: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up the PM interpreter
+        id: pm-python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - name: Set up the ordinary module interpreter
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install test dependencies
-        run: pip install pytest numpy PyYAML==6.0.3
-
-      - name: Stub hermes-agent ABC
+      - name: Check out the dependency manager
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 422ad1861856dd9b80b947fbad9f39d1580f6b41
+          path: artifacts/hermes-core
+      - name: Prepare ordinary module test dependencies through PM
+        working-directory: artifacts/hermes-core
+        env:
+          PM_PYTHON: ${{ steps.pm-python.outputs.python-path }}
+        run: >-
+          "$PM_PYTHON" -m pm.build_env
+          --out "${GITHUB_WORKSPACE}/artifacts/ordinary-env"
+          --python "$(command -v python)"
+          --cache "$UV_CACHE_DIR"
+          --requirement pytest --requirement tiktoken
+      - name: Verify ordinary modules without a ContextEngine host
         run: |
-          mkdir -p agent
-          cat > agent/__init__.py <<'STUB'
-          STUB
-          cat > agent/context_engine.py <<'STUB'
-          """Minimal stub of hermes-agent ContextEngine ABC for CI."""
-          class ContextEngine:
-              """Base class stub — just enough for LCMEngine to import."""
-              def __init__(self, **kwargs):
-                  self.compression_count = 0
-                  self.last_prompt_tokens = 0
-              def compress(self, messages, current_tokens=None, **kwargs):
-                  raise NotImplementedError
-              def on_session_start(self, session_id, **kwargs):
-                  pass
-              def on_session_end(self, **kwargs):
-                  pass
-              def on_session_reset(self):
-                  self.compression_count = 0
-                  self.last_prompt_tokens = 0
-              def get_tool_schemas(self):
-                  return []
-              def handle_tool_call(self, name, args, **kwargs):
-                  raise NotImplementedError
-              def get_status(self):
-                  return {}
-          STUB
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/ordinary-env/bin/python"
+          "$PYTHON" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")'
+          "$PYTHON" -m pytest tests/test_chunking.py tests/test_occurrence_time.py tests/test_runtime_time_contract.py -q
 
-      - name: Run pytest under low file descriptor limit
+  test:
+    name: Real Hermes host on Python 3.14
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      HERMES_HOME: ${{ github.workspace }}/artifacts/dev-home
+      HERMES_RUNTIME_DIR: ${{ github.workspace }}/artifacts/tools
+      UV_CACHE_DIR: ${{ github.workspace }}/artifacts/uv-cache
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up the real host interpreter
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Check out the observed Hermes host
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.core_repository || 'NousResearch/hermes-agent' }}
+          ref: ${{ inputs.core_ref || '422ad1861856dd9b80b947fbad9f39d1580f6b41' }}
+          path: artifacts/hermes-core
+
+      - name: Prepare the complete host and test dependency graph through PM
+        working-directory: artifacts/hermes-core
+        run: >-
+          python -m pm.build_env --source .
+          --out "${GITHUB_WORKSPACE}/artifacts/hermes-host-env"
+          --python "$(command -v python)" --cache "$UV_CACHE_DIR"
+          --group test --group dev
+          --extra anthropic --extra messaging --extra mcp --extra vision --extra pty --extra web
+          --no-install-project
+
+      - name: Prepare LCM dependencies from the real host environment through PM
+        run: >-
+          "${GITHUB_WORKSPACE}/artifacts/hermes-host-env/bin/python"
+          scripts/prepare_release_environment.py
+          --core-root "${GITHUB_WORKSPACE}/artifacts/hermes-core"
+          --out "${GITHUB_WORKSPACE}/artifacts/lcm-test-env"
+          --cache "$UV_CACHE_DIR"
+
+      - name: Run isolated regressions with the real host under low file descriptor limit
+        env:
+          LCM_HERMES_CORE_ROOT: ${{ github.workspace }}/artifacts/hermes-core
+          HERMES_LCM_HOST_ROOT: ${{ github.workspace }}/artifacts/hermes-core
+          PYTHONPATH: ${{ github.workspace }}/artifacts/hermes-core
+          HERMES_HOME: ${{ github.workspace }}/artifacts/dev-home
+          TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
         run: |
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/lcm-test-env/bin/python"
+          "$PYTHON" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")'
+          "$PYTHON" scripts/validate_release_host.py --core-root "$LCM_HERMES_CORE_ROOT"
           ulimit -n 1024
-          python -m pytest tests/ -q
+          "$PYTHON" -m pytest tests/ -q
 
       - name: Run static validation
         run: |
-          python scripts/validate_dependency_contract.py
-          python -m compileall -q .
-          python -m py_compile scripts/import_lossless_claw.py
-          bash -n scripts/install.sh scripts/update.sh
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/lcm-test-env/bin/python"
+          "$PYTHON" scripts/validate_dependency_contract.py
+          "$PYTHON" -m compileall -q -x '/artifacts/' .
+          "$PYTHON" -m py_compile scripts/import_lossless_claw.py scripts/validate_release_host.py
+          bash -n scripts/install.sh scripts/update.sh scripts/validate_release.sh
           git diff --check
 
   test-macos-paths:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/abm/native-portability-macos-')
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/abm/native-portability-macos-')
     runs-on: macos-latest
     timeout-minutes: 10
     env:
@@ -125,7 +188,7 @@ jobs:
           if-no-files-found: error
 
   test-windows-portability:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/abm/native-portability-windows-')
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/abm/native-portability-windows-')
     runs-on: windows-latest
     timeout-minutes: 10
     env:

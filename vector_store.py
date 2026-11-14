@@ -574,6 +574,15 @@ class VectorStore:
             for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
 
+    def _summary_event_expr(self, bound: str) -> str:
+        from .event_time import event_bound_sql
+        if not self._table_columns("summary_event_time"):
+            return "NULL"
+        return event_bound_sql(bound, "sn")
+
+    def _message_event_expr(self) -> str:
+        return "m.observed_at" if "observed_at" in self._table_columns("messages") else "NULL"
+
     def _current_profile(self) -> sqlite3.Row | None:
         # The current SUMMARY profile. Task-scoped so a coexisting active chunk
         # profile can never be mistaken for the summary corpus's current profile.
@@ -1381,15 +1390,9 @@ class VectorStore:
             return []
         if (since is not None or until is not None) and "latest_at" not in columns:
             return []
-        # Per-row fallback matters, not just column existence: the DAG
-        # migration adds ``latest_at`` without backfilling legacy rows, and a
-        # bare ``latest_at DESC`` sorts those NULLs last — silently dropping
-        # legacy summaries out of the bounded window on upgraded databases.
-        recency_expr = (
-            "COALESCE(sn.latest_at, sn.created_at)"
-            if "latest_at" in columns
-            else "sn.created_at"
-        )
+        # Unknown source-event dates sort last and cannot satisfy a date
+        # filter. Storage/summary creation dates are never event-time substitutes.
+        recency_expr = self._summary_event_expr("latest_at")
         where = ["m.identity_hash = ?", "m.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if "suppressed_at" in columns:
@@ -1398,7 +1401,7 @@ class VectorStore:
             where.append(f"{recency_expr} >= ?")
             args.append(float(since))
         if until is not None:
-            where.append(f"{recency_expr} <= ?")
+            where.append(f"{self._summary_event_expr('earliest_at')} <= ?")
             args.append(float(until))
         args.append(int(limit))
         with self._optional_temp_id_table(conversation_ids) as conversation_table:
@@ -1706,7 +1709,7 @@ class VectorStore:
         columns = self._table_columns("summary_nodes")
         if (since is not None or until is not None) and "latest_at" not in columns:
             return []
-        recency_expr = "sn.latest_at"
+        recency_expr = self._summary_event_expr("latest_at")
         with self._temp_id_table(unique_ids) as table:
             where = ["1 = 1"]
             args: list[object] = []
@@ -1716,7 +1719,7 @@ class VectorStore:
                 where.append(f"{recency_expr} >= ?")
                 args.append(float(since))
             if until is not None:
-                where.append(f"{recency_expr} <= ?")
+                where.append(f"{self._summary_event_expr('earliest_at')} <= ?")
                 args.append(float(until))
             with self._optional_temp_id_table(conversation_ids) as conversation_table:
                 conversation_join = (
@@ -1816,10 +1819,10 @@ class VectorStore:
         where = ["cm.identity_hash = ?", "cm.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if since is not None:
-            where.append("m.timestamp >= ?")
+            where.append(f"{self._message_event_expr()} >= ?")
             args.append(float(since))
         if until is not None:
-            where.append("m.timestamp <= ?")
+            where.append(f"{self._message_event_expr()} <= ?")
             args.append(float(until))
         if source is not None:
             where.append("m.source = ?")
@@ -1862,11 +1865,7 @@ class VectorStore:
         gates on ``source is None`` before calling this).
         """
         columns = self._table_columns("summary_nodes")
-        recency_expr = (
-            "COALESCE(sn.latest_at, sn.created_at)"
-            if "latest_at" in columns
-            else "sn.created_at"
-        )
+        recency_expr = self._summary_event_expr("latest_at")
         where = ["m.identity_hash = ?", "m.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if "suppressed_at" in columns:
@@ -1875,7 +1874,7 @@ class VectorStore:
             where.append(f"{recency_expr} >= ?")
             args.append(float(since))
         if until is not None:
-            where.append(f"{recency_expr} <= ?")
+            where.append(f"{self._summary_event_expr('earliest_at')} <= ?")
             args.append(float(until))
         with self._optional_temp_id_table(conversation_ids) as conversation_table:
             conversation_join = (
@@ -2625,10 +2624,10 @@ class VectorStore:
         where = ["cm.identity_hash = ?", "cm.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if since is not None:
-            where.append("m.timestamp >= ?")
+            where.append(f"{self._message_event_expr()} >= ?")
             args.append(float(since))
         if until is not None:
-            where.append("m.timestamp <= ?")
+            where.append(f"{self._message_event_expr()} <= ?")
             args.append(float(until))
         if source is not None:
             where.append("m.source = ?")
@@ -2647,7 +2646,7 @@ class VectorStore:
                 JOIN messages m ON m.store_id = cm.store_id
                 {conversation_join}
                 WHERE {' AND '.join(where)}
-                ORDER BY m.timestamp DESC, cm.chunk_id DESC
+                ORDER BY {self._message_event_expr()} DESC, cm.chunk_id DESC
                 LIMIT ?
                 """,
                 args,

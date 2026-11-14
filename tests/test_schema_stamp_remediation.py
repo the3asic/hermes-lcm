@@ -598,8 +598,9 @@ def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
     # Early feature tables are gone; core tables remain untouched.
     remaining = _table_names(db_path)
-    assert not any(t.startswith(("lcm_rollup", "lcm_embedding")) for t in remaining)
-    assert {"messages", "summary_nodes"} <= remaining
+    assert not any(t.startswith(("lcm_rollup", "lcm_embedding"))
+                   for t in remaining - {"lcm_rollup_event_time"})
+    assert {"messages", "summary_nodes", "lcm_rollup_event_time"} <= remaining
 
     # refuse now passes, and each feature store reconstructs the final shape.
     conn = sqlite3.connect(db_path)
@@ -617,6 +618,42 @@ def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
         assert db_bootstrap.verify_embedding_schema(vectors._conn) == []
     finally:
         vectors.close()
+
+
+def test_rollup_family_repair_keeps_ordinary_summary_statements_usable(tmp_path):
+    """Native SQLite can compile publication and cleanup while rollups are disabled."""
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path, with_features=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TABLE lcm_rollup_state")
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=True)
+        assert result["status"] == "ok"
+        assert "lcm_rollup_invalidations" in result["dropped_tables"]
+        for statement in (
+            "INSERT INTO summary_event_time SELECT * FROM summary_event_time WHERE 0",
+            "UPDATE summary_nodes SET summary = summary WHERE 0",
+            "DELETE FROM summary_nodes WHERE 0",
+        ):
+            conn.execute("EXPLAIN " + statement).fetchall()
+    finally:
+        conn.close()
+    dag = SummaryDAG(db_path)
+    dag.close()
+    rollups = RollupStore(db_path)
+    try:
+        assert db_bootstrap.verify_temporal_rollup_schema(rollups.connection) == []
+        rollups.connection.execute(
+            "EXPLAIN INSERT INTO summary_event_time SELECT * FROM summary_event_time WHERE 0"
+        ).fetchall()
+    finally:
+        rollups.close()
 
 
 def test_early_variant_chunk_family_remediates(tmp_path):
@@ -708,8 +745,11 @@ def test_doctor_repair_schema_stamp_dry_run_and_apply(tmp_path):
     assert f"schema_version_reset_to: {db_bootstrap.SCHEMA_VERSION}" in applied
     assert "dropped: lcm_rollups" in applied
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
+    remaining = _table_names(db_path)
+    assert "lcm_rollup_event_time" in remaining
     assert not any(
-        t.startswith(("lcm_rollup", "lcm_embedding")) for t in _table_names(db_path)
+        t.startswith(("lcm_rollup", "lcm_embedding"))
+        for t in remaining - {"lcm_rollup_event_time"}
     )
 
 
