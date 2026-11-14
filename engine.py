@@ -2376,6 +2376,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages,
             fresh_tail_count=self._config.fresh_tail_count,
             fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
+            api_mode=self.api_mode or None,
         )
 
     def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
@@ -6547,9 +6548,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if message.get("role") == "user" and not self._is_preserved_todo_context_message(message):
                 live_user = message
                 break
-        reserve = count_message_tokens(live_user) if live_user is not None else 0
+        live_unit_index = next((index for index, unit in enumerate(units) if unit[0] is live_user), None)
         selected = []
-        used = reserve
+        payload_cache = {}
         skipped = False
         self._assembly_protected_group_dropped = False
         for index in range(len(units) - 1, -1, -1):
@@ -6557,8 +6558,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if live_user is not None and unit[0] is live_user:
                 selected.append((index, unit))
                 continue
-            cost = sum(count_message_tokens(message) for message in unit)
-            if used + cost > budget:
+            candidate_units = [*selected, (index, unit)]
+            if live_user is not None and not any(group[0] is live_user for _, group in candidate_units):
+                candidate_units.append((live_unit_index, [live_user]))
+            candidate = [message for _, group in sorted(candidate_units) for message in group]
+            # Price exactly the candidate list: adjacent assistants and complete
+            # tool exchanges can change which signed carrier reaches the wire.
+            cost = count_messages_tokens(candidate, api_mode=self.api_mode or None, _payload_cache=payload_cache)
+            if cost > budget:
                 if unit[0].get("role") == "assistant" and unit[0].get("tool_calls"):
                     if index == len(units) - 1:
                         self._assembly_protected_group_dropped = True
@@ -6571,7 +6578,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # exchange with older assistant traces.
                 continue
             selected.append((index, unit))
-            used += cost
         if live_user is not None and not any(unit[0] is live_user for _, unit in selected):
             selected.append((next(i for i, unit in enumerate(units) if unit[0] is live_user), [live_user]))
         return [message for _, unit in sorted(selected) for message in unit]
@@ -6600,9 +6606,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # recovery pressure. Project the inputs onto canonical message keys
         # here so the recovery guarantee holds no matter which entry point
         # (_assemble_overflow_recovery_context, the post-leaf-compaction
-        # assembly in compaction.py) reached this method — replay metadata
-        # that count_message_tokens does not model must not survive into a
-        # payload assembled against the cap. Normal (override-less) assembly
+        # assembly in compaction.py) reached this method. Retained carriers
+        # and stamps must be removed together before recovery budgeting.
+        # Normal (override-less) assembly
         # never strips: replay fields are the host's business there.
         if assembly_cap_override is not None:
             system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
@@ -6662,7 +6668,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             tail_selected = self._select_atomic_tail_groups(tail_for_selection, max(0, assembly_cap - used))
             budget_projection_dropped = len(tail_selected) < len(tail_for_selection)
-            tail_token_total = count_messages_tokens(tail_selected)
+            tail_token_total = count_messages_tokens(tail_selected, api_mode=self.api_mode or None)
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
             selected_source_messages = [
@@ -6774,6 +6780,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     trimmed["content"] = "\n\n---\n\n".join(parts)
                     trimmed_result.append(trimmed)
             result = self._sanitize_active_context_messages(trimmed_result)
+
+        # Cleanup/proactive recall can add payload after initial selection.
+        # Recheck the final list under the same route and trim complete groups.
+        if assembly_cap is not None and count_messages_tokens(result, api_mode=self.api_mode or None) > assembly_cap:
+            prefix = result[:1] if leading_msg is not None else []
+            rest = result[len(prefix):]
+            available = max(0, assembly_cap - count_messages_tokens(prefix, api_mode=self.api_mode or None))
+            bounded = self._select_atomic_tail_groups(rest, available)
+            if len(bounded) < len(rest):
+                budget_projection_dropped = True
+            result = self._sanitize_active_context_messages(prefix + bounded)
 
         return self._remember_assembled_replay(
             result, assembly_source_messages, assembly_id=assembly_id,
@@ -6935,8 +6952,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Recovery rebuilds the provider-visible payload from canonical
         # message parts only. Transports replay provider metadata such as
         # ``reasoning`` / ``codex_reasoning_items`` / ``codex_message_items``
-        # alongside each message; count_message_tokens does not count them,
-        # so retaining them would let a recovered context that measured at
+        # alongside each message. Recovery strips those carriers and their
+        # reasoning stamps together, so a recovered context measured at
         # the cap ship a payload far past it and re-overflow on the next
         # request. Copies, never mutates the caller's dicts.
         system_msg = _strip_replay_metadata_for_recovery_message(system_msg)

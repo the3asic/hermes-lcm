@@ -175,14 +175,15 @@ run_gate() {
   fi
 }
 
+# Release gates require a real source host. Standalone unit/benchmark ABCs
+# remain available for isolated development, but cannot certify replay budgets.
+: "${LCM_HERMES_CORE_ROOT:?Set LCM_HERMES_CORE_ROOT to the Hermes Core source tree}"
+export PYTHONPATH="$LCM_HERMES_CORE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HERMES_LCM_HOST_ROOT="$LCM_HERMES_CORE_ROOT"
+"$PYTHON_BIN" -c 'from agent.context_engine import ContextEngine; from agent.message_sanitization import native_anthropic_row_costs; from agent.replayed_reasoning import codex_reasoning_replay_tokens'
+
 run_pytest() {
-  "$PYTHON_BIN" - "$@" <<'PY'
-import sys
-from benchmarking.standalone import ensure_agent_context_engine_importable
-ensure_agent_context_engine_importable()
-import pytest
-raise SystemExit(pytest.main(sys.argv[1:]))
-PY
+  "$PYTHON_BIN" -m pytest "$@"
 }
 
 run_low_fd_pytest() {
