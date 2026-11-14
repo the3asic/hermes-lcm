@@ -995,7 +995,7 @@ def test_dependency_contract_validation_is_wired_into_ci_and_release_gate():
         REPO_ROOT / "scripts" / "validate_release.sh"
     ).read_text(encoding="utf-8")
 
-    assert "python scripts/validate_dependency_contract.py" in ci_workflow
+    assert '"$PYTHON" scripts/validate_dependency_contract.py' in ci_workflow
     assert (
         'run_gate "dependency contract" "$PYTHON_BIN" '
         "scripts/validate_dependency_contract.py --report-environment"

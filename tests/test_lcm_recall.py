@@ -270,7 +270,7 @@ def test_scope_bias_boosts_current_conversation_without_filtering(recall_engine,
     assert cross in {h["node_id"] for h in biased["hits"]}
 
 
-def test_recency_boost_moves_ranking(recall_engine, monkeypatch):
+def test_creation_dates_do_not_boost_unknown_summary_ranking(recall_engine, monkeypatch):
     old_strong = _add_summary(recall_engine, "old kanban board", session_id="session-a", created_at=1.0, latest_at=1.0)
     new_weak = _add_summary(recall_engine, "new kanban board", session_id="session-b", created_at=1.0, latest_at=time.time())
     # Neither summary has source event dates; creation/storage windows must

@@ -104,7 +104,7 @@ class TestChunkWriteAndKnn:
         )
         assert {row[0] for row in result} == {"12:0"}
 
-    def test_recency_window(self, store):
+    def test_recency_window_excludes_unknown_source_event_dates(self, store):
         _write(store, "10:0", 10, 0, [1.0, 0.0, 0.0, 0.0])
         _write(store, "12:0", 12, 0, [1.0, 0.0, 0.0, 0.0])
         result = store.knn_chunks(

@@ -913,7 +913,12 @@ def test_publishing_summary_for_ready_day_marks_it_stale(rollup_parts):
     latest_at = _timestamp(target_day, 22)
     from hermes_lcm.rollup_builder import mark_stale_for_published_summary
 
-    assert mark_stale_for_published_summary(dag, scope, latest_at, latest_at) == 3
+    # Legacy storage and source-event coverage each enqueue this UTC day.
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_rollup_invalidations WHERE node_id=?",
+        (later_node,),
+    ).fetchone()[0] == 2
+    assert mark_stale_for_published_summary(dag, scope, latest_at, latest_at) == 6
     assert later_node  # published node exists
     assert store.get_rollup("day", target_day.isoformat(), scope)["status"] == "stale"
     assert store.get_rollup("week", "2026-07-13", scope)["status"] == "stale"
@@ -1044,12 +1049,17 @@ def test_deletion_staleness_bumps_generation_and_supersedes_inflight(rollup_part
 
     dag.connection.execute("DELETE FROM summary_nodes WHERE node_id=?", (node_id,))
     dag.connection.commit()
-    assert builder_module.mark_stale_for_deleted_nodes(dag, [node_id]) == 1
+    # Both persisted time bases invalidate the same day on deletion.
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_rollup_invalidations WHERE node_id=?",
+        (node_id,),
+    ).fetchone()[0] == 2
+    assert builder_module.mark_stale_for_deleted_nodes(dag, [node_id]) == 2
     # The in-flight build cannot publish deleted-node content over the stale row.
     assert store.mark_ready(token, "deleted content", 1, [node_id], "fp") is False
     row = store.get_rollup("day", day.isoformat(), scope)
     assert row["status"] == "stale"
-    assert row["generation"] == token.generation + 1
+    assert row["generation"] == token.generation + 2
 
 
 def test_no_source_stale_day_is_resolved_not_left_lingering(rollup_parts):
@@ -1675,7 +1685,11 @@ def test_committed_mutation_event_survives_hook_gap_and_reconciles(rollup_parts)
     store.close()
     reopened = RollupStore(dag.db_path)
     try:
-        assert reopened.drain_invalidations(event_limit=256, day_budget=256) == 1
+        assert reopened.connection.execute(
+            "SELECT COUNT(*) FROM lcm_rollup_invalidations WHERE scope=?",
+            (scope,),
+        ).fetchone()[0] == 2
+        assert reopened.drain_invalidations(event_limit=256, day_budget=256) == 2
         assert reopened.get_rollup("day", day.isoformat(), scope)["status"] == "stale"
     finally:
         reopened.close()
