@@ -5,13 +5,25 @@ on:
     branches: [main, "abm/native-portability-*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      core_repository:
+        description: Hermes Core repository for the native-host checks
+        required: true
+        default: NousResearch/hermes-agent
+        type: string
+      core_ref:
+        description: Exact Core revision for the native-host checks
+        required: true
+        default: 422ad1861856dd9b80b947fbad9f39d1580f6b41
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   workflow-lint:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -24,7 +36,7 @@ jobs:
           "$(go env GOPATH)"/bin/actionlint
 
   lint:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -42,7 +54,7 @@ jobs:
 
   test-ordinary-python:
     name: Ordinary plugin modules on Python ${{ matrix.python-version }}
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -88,7 +100,7 @@ jobs:
 
   test:
     name: Real Hermes host on Python 3.14
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       HERMES_HOME: ${{ github.workspace }}/artifacts/dev-home
@@ -106,8 +118,8 @@ jobs:
       - name: Check out the observed Hermes host
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: NousResearch/hermes-agent
-          ref: 422ad1861856dd9b80b947fbad9f39d1580f6b41
+          repository: ${{ inputs.core_repository || 'NousResearch/hermes-agent' }}
+          ref: ${{ inputs.core_ref || '422ad1861856dd9b80b947fbad9f39d1580f6b41' }}
           path: artifacts/hermes-core
 
       - name: Prepare the complete host and test dependency graph through PM
@@ -152,7 +164,7 @@ jobs:
           git diff --check
 
   test-macos-paths:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/abm/native-portability-macos-')
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/abm/native-portability-macos-')
     runs-on: macos-latest
     timeout-minutes: 10
     env:
@@ -176,7 +188,7 @@ jobs:
           if-no-files-found: error
 
   test-windows-portability:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/abm/native-portability-windows-')
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/abm/native-portability-windows-')
     runs-on: windows-latest
     timeout-minutes: 10
     env:
