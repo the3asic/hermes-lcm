@@ -11,6 +11,7 @@ still depends on SQLite WAL recovery.
 
 from __future__ import annotations
 
+import importlib.util
 import sqlite3
 import threading
 from pathlib import Path
@@ -34,18 +35,36 @@ from hermes_lcm.lifecycle_state import LifecycleStateStore
 class TestConfigureConnectionPragmas:
     """Assert that configure_connection() sets the intended PRAGMAs."""
 
-    @pytest.fixture()
-    def db_path(self, tmp_path: Path):
-        """Return a temp file path for an on-disk database (WAL requires a
-        real file — :memory: silently reports journal_mode='memory')."""
-        return tmp_path / "test.db"
+    @pytest.fixture(params=["fresh", "existing-wal"])
+    def journal_state(self, request):
+        return request.param
 
-    def test_journal_mode_is_wal(self, db_path: Path):
+    @pytest.fixture()
+    def db_path(self, tmp_path: Path, journal_state):
+        """Use actual files for both fresh stores and an existing WAL header."""
+        path = tmp_path / "test.db"
+        if journal_state == "existing-wal":
+            with sqlite3.connect(path) as conn:
+                assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        return path
+
+    @pytest.fixture()
+    def expected_mode(self, db_path: Path, journal_state):
+        if journal_state == "existing-wal" or importlib.util.find_spec("hermes_state_wal") is None:
+            return "wal"
+        from hermes_state_wal import apply_wal_with_fallback
+
+        with sqlite3.connect(db_path.with_name("host-policy.db")) as conn:
+            mode = apply_wal_with_fallback(conn, db_label="lcm-test-host-policy")
+        assert mode in {"wal", "delete"}
+        return mode
+
+    def test_journal_mode_follows_actual_host_policy(self, db_path: Path, expected_mode):
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         conn.close()
-        assert mode == "wal", f"expected journal_mode=wal, got {mode!r}"
+        assert mode == expected_mode, f"expected host journal_mode={expected_mode}, got {mode!r}"
 
     def test_synchronous_is_full(self, db_path: Path):
         conn = sqlite3.connect(str(db_path))
@@ -62,20 +81,22 @@ class TestConfigureConnectionPragmas:
         conn.close()
         assert val == 30_000, f"expected busy_timeout=30000, got {val}"
 
-    def test_wal_autocheckpoint(self, db_path: Path):
+    def test_wal_autocheckpoint(self, db_path: Path, expected_mode):
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         # After setting, PRAGMA wal_autocheckpoint returns the NEW value.
         val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
         conn.close()
-        assert val == 500, f"expected wal_autocheckpoint=500, got {val}"
+        expected = 500 if expected_mode == "wal" else 1000
+        assert val == expected, f"expected wal_autocheckpoint={expected}, got {val}"
 
-    def test_journal_size_limit(self, db_path: Path):
+    def test_journal_size_limit(self, db_path: Path, expected_mode):
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         val = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
         conn.close()
-        assert val == 67_108_864, f"expected journal_size_limit=67108864, got {val}"
+        expected = 67_108_864 if expected_mode == "wal" else -1
+        assert val == expected, f"expected journal_size_limit={expected}, got {val}"
 
     def test_mmap_size(self, db_path: Path):
         conn = sqlite3.connect(str(db_path))
