@@ -12,6 +12,7 @@ from typing import Callable, Sequence
 
 from .config import LCMConfig
 from .dag import SummaryDAG
+from .event_time import combine_coverage, read_event_time
 from .escalation import _deterministic_truncate, summarize_with_escalation
 from .rollup_periods import CoverageNode, canonical_frontier, load_source_lineage
 from .rollup_store import RollupBuildToken, RollupStore
@@ -149,11 +150,11 @@ def _scope_frontier_staged(
                 """
                 SELECT node.node_id, node.depth, node.summary, node.source_ids,
                        node.source_type,
-                       COALESCE(node.earliest_at, node.created_at) AS earliest_at,
-                       COALESCE(node.latest_at, node.created_at) AS latest_at
+                       (SELECT et.earliest_at FROM summary_event_time et WHERE et.node_id = node.node_id) AS earliest_at,
+                       (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = node.node_id) AS latest_at
                 FROM temp.lcm_scope_frontier_ids wanted
                 JOIN summary_nodes node ON node.node_id = wanted.node_id
-                ORDER BY COALESCE(node.latest_at, node.created_at), node.node_id
+                ORDER BY (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = node.node_id), node.node_id
                 """
             ).fetchall()
         finally:
@@ -208,6 +209,8 @@ def _scope_frontier_staged(
         frontier: list[dict[str, object]] = []
         for node in canonical_frontier(candidates, source_lineage=source_lineage):
             info = meta[node.node_id]
+            if not read_event_time(connection, node.node_id).complete:
+                raise ValueError("Rollup scope has unknown or mixed source event time")
             frontier.append(
                 {
                     "node_id": node.node_id,
@@ -262,6 +265,8 @@ def _summarize_capped(
     summarizer: Summarizer,
     circuit_breaker: object | None,
     spend_guard: object | None,
+    source_provenance: dict | None = None,
+    depth: int = 1,
 ) -> tuple[str, int]:
     """Use escalation until the result is within the configured hard cap."""
     target = max(1, min(int(target_tokens), int(max_tokens)))
@@ -277,6 +282,8 @@ def _summarize_capped(
             l3_truncate_tokens=hard_max,
             circuit_breaker=circuit_breaker,
             spend_guard=spend_guard,
+            source_provenance=source_provenance,
+            depth=depth,
             **_summary_controls(config),
         )
         summary = str(summary)
@@ -337,7 +344,7 @@ def build_day(
         source_ids = sorted(int(source["node_id"]) for source in sources)
         fingerprint = _stable_hash(
             [
-                [int(source["node_id"]), hashlib.sha256(str(source["summary"]).encode("utf-8")).hexdigest()]
+                ["observed_at_v1", int(source["node_id"]), hashlib.sha256(str(source["summary"]).encode("utf-8")).hexdigest()]
                 for source in sorted(sources, key=lambda source: int(source["node_id"]))
             ]
         )
@@ -353,8 +360,16 @@ def build_day(
             summarizer=summarizer,
             circuit_breaker=circuit_breaker,
             spend_guard=spend_guard,
+            source_provenance={
+                "source_type": "summary_nodes", "node_ids": source_ids,
+                "period_kind": "day", "period_start": day.isoformat(),
+                "time_basis": "observed_at",
+                "event_time": combine_coverage(
+                    read_event_time(dag.connection, node_id) for node_id in source_ids
+                ).as_dict(),
+            },
         )
-        published = store.mark_ready(token, summary, token_count, source_ids, fingerprint)
+        published = store.mark_ready(token, summary, token_count, source_ids, fingerprint, time_basis="observed_at_v1")
         if published:
             # A (re)built daily makes any already-published week/month that
             # covered the previous daily outdated: stale them so they rebuild
@@ -388,7 +403,13 @@ def _daily_statuses(
         return {}
     rows = connection.execute(
         """
-        SELECT period_start, status, source_fingerprint, summary, token_count, rollup_id
+        SELECT period_start,
+               CASE WHEN EXISTS (
+                   SELECT 1 FROM lcm_rollup_event_time et
+                   WHERE et.rollup_id=lcm_rollups.rollup_id
+                     AND et.source_fingerprint=lcm_rollups.source_fingerprint
+               ) THEN status ELSE 'stale' END AS status,
+               source_fingerprint, summary, token_count, rollup_id
         FROM lcm_rollups
         WHERE period_kind = 'day'
           AND period_start >= ?
@@ -504,8 +525,8 @@ def _canonical_aggregate_sources_staged(
                 """
                 SELECT node.node_id, node.depth, node.summary, node.source_ids,
                        node.source_type,
-                       COALESCE(node.earliest_at, node.created_at),
-                       COALESCE(node.latest_at, node.created_at)
+                       (SELECT et.earliest_at FROM summary_event_time et WHERE et.node_id = node.node_id),
+                       (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = node.node_id)
                 FROM temp.lcm_aggregate_source_ids wanted
                 JOIN summary_nodes node ON node.node_id = wanted.node_id
                 ORDER BY node.node_id
@@ -537,6 +558,8 @@ def _canonical_aggregate_sources_staged(
                 latest_at=row[6],
             )
         )
+        if not read_event_time(connection, node_id).complete:
+            raise ValueError("Aggregate sources have unknown or mixed source event time")
         summaries[node_id] = str(row[2] or "")
     return [
         {"node_id": node.node_id, "summary": summaries[node.node_id]}
@@ -610,7 +633,7 @@ def _build_aggregate(
             store.resolve_no_source(token)
             return None
 
-        fingerprint = _stable_hash(days)
+        fingerprint = _stable_hash({"time_basis": "observed_at_v1", "days": days})
         constituent_source_ids = _rollup_source_ids(
             store,
             [int(row["rollup_id"]) for _day_key, row in ready],
@@ -632,8 +655,17 @@ def _build_aggregate(
             summarizer=summarizer,
             circuit_breaker=circuit_breaker,
             spend_guard=spend_guard,
+            depth=2,
+            source_provenance={
+                "source_type": "summary_nodes", "node_ids": source_ids,
+                "period_kind": period_kind, "period_start": start.isoformat(),
+                "time_basis": "observed_at",
+                "event_time": combine_coverage(
+                    read_event_time(dag.connection, node_id) for node_id in source_ids
+                ).as_dict(),
+            },
         )
-        store.mark_ready(token, summary, token_count, source_ids, fingerprint)
+        store.mark_ready(token, summary, token_count, source_ids, fingerprint, time_basis="observed_at_v1")
         return store.get_rollup(period_kind, start.isoformat(), scope)
     except Exception as exc:
         _mark_failed(store, token, exc)
@@ -704,8 +736,9 @@ def mark_stale_for_published_summary(
     ``ready`` and apparently current. A summary whose coverage spans past midnight
     covers more than one day; keying only on ``latest_at`` left the earlier day(s)
     ``ready`` (maintainer #388 B2). The covered span is
-    ``[earliest_at, latest_at]`` (each falling back to ``created_at``); the shared
-    durable outbox drains the interval in bounded UTC-day chunks.
+    New publications enqueue their known ``observed_at`` interval atomically
+    with source coverage. Unknown dates never acquire a creation-date surrogate.
+    The durable outbox drains intervals in bounded UTC-day chunks.
     """
     store: RollupStore | None = None
     try:

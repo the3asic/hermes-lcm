@@ -250,7 +250,7 @@ def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple
     normalized = normalize_search_sort(sort)
     score = float(result.get("_fallback_score") or 0.0)
     directness = float(result.get("_directness_score") or 0.0)
-    timestamp = float(result.get("timestamp") or 0.0)
+    timestamp = float(result.get("observed_at") or 0.0)
     role_bias = _message_role_bias(result.get("role"))
 
     if normalized == "relevance":
@@ -267,7 +267,7 @@ def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[floa
     rank = result.get("search_rank")
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_directness_score") or 0.0)
-    timestamp = float(result.get("timestamp") or 0.0)
+    timestamp = float(result.get("observed_at") or 0.0)
     role_bias = _message_role_bias(result.get("role"))
 
     if normalized == "relevance":
@@ -284,7 +284,7 @@ def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
     rank = result.get("search_rank")
     rank_value = float(rank) if rank is not None else float("inf")
     if normalized == "hybrid":
-        timestamp = float(result.get("timestamp") or 0.0)
+        timestamp = float(result.get("observed_at") or 0.0)
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
         return rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
     return rank_value
@@ -446,6 +446,13 @@ class MessageStore:
         )
         self._conn.execute(
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_observed "
+            "ON messages(session_id, observed_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_observed ON messages(observed_at)"
         )
 
     # -- Write operations ---------------------------------------------------
@@ -754,10 +761,10 @@ class MessageStore:
             where.append(f"role IN ({placeholders})")
             args.extend(roles)
         if time_from is not None:
-            where.append("timestamp >= ?")
+            where.append("observed_at >= ?")
             args.append(time_from)
         if time_to is not None:
-            where.append("timestamp <= ?")
+            where.append("observed_at <= ?")
             args.append(time_to)
         return where, args
 
@@ -1051,7 +1058,34 @@ class MessageStore:
             "stats_after": stats_after,
         }
 
+    def get_event_time_coverage(self, store_ids: List[int]) -> dict[str, Any]:
+        from .event_time import source_event_time
+        return source_event_time(self._conn, store_ids, "messages").as_dict()
+
+    def get_source_times(self, store_ids: List[int]) -> list[dict[str, Any]]:
+        """Bounded metadata-only event/ingest provenance for summary prompts."""
+        result = []
+        ids = sorted(set(store_ids))
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            marks = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"SELECT store_id, observed_at, observed_at_source, COALESCE(ingested_at,timestamp) "
+                f"FROM messages WHERE store_id IN ({marks}) ORDER BY store_id", batch,
+            ).fetchall()
+            result.extend({
+                "store_id": row[0], "observed_at": row[1], "observed_at_source": row[2],
+                "observed_at_utc": datetime.fromtimestamp(row[1], tz=timezone.utc).isoformat() if row[1] is not None else None,
+                "ingested_at": row[3],
+            } for row in rows)
+        return result
+
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
+        """Legacy storage-time bounds, retained for code-version recovery.
+
+        New summary publication records observed event coverage separately in
+        summary_event_time; these values never represent event dates.
+        """
         if not store_ids:
             return None, None
         placeholders = ",".join("?" * len(store_ids))
@@ -1346,7 +1380,7 @@ class MessageStore:
 
         order_by = _build_search_order_by(
             sort,
-            "m.timestamp",
+            "COALESCE(m.observed_at, 0)",
             _MESSAGE_ROLE_BIAS_SQL,
         )
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
@@ -1375,10 +1409,10 @@ class MessageStore:
                     where.append("m.role = ?")
                     args.append(role)
                 if time_from is not None:
-                    where.append("m.timestamp >= ?")
+                    where.append("m.observed_at >= ?")
                     args.append(time_from)
                 if time_to is not None:
-                    where.append("m.timestamp <= ?")
+                    where.append("m.observed_at <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
                 rows = self._conn.execute(
@@ -1473,10 +1507,10 @@ class MessageStore:
             where.append("role = ?")
             args.append(role)
         if time_from is not None:
-            where.append("timestamp >= ?")
+            where.append("observed_at >= ?")
             args.append(time_from)
         if time_to is not None:
-            where.append("timestamp <= ?")
+            where.append("observed_at <= ?")
             args.append(time_to)
         like_clauses = []
         for term in terms:
@@ -1555,7 +1589,7 @@ class MessageStore:
                 directness_expr = f"(({unique_score_expr}) * 5.0) - MIN(({repetition_expr}), 6)"
             order_args.extend(directness_args)
             order_by = (
-                f"ORDER BY timestamp DESC, {role_bias} ASC, ({score_expr}) DESC, "
+                f"ORDER BY observed_at DESC, {role_bias} ASC, ({score_expr}) DESC, "
                 f"({directness_expr}) DESC, store_id DESC"
             )
 

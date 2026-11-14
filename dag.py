@@ -50,6 +50,10 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
+from .event_time import (
+    EventTimeCoverage, ensure_event_time_schema, event_bound_sql,
+    publish_event_time, read_event_time,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +74,7 @@ def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
 def _fallback_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
     normalized = normalize_search_sort(sort)
     score = float(node.search_rank or 0.0) * -1.0
-    recency = float(node.latest_at or node.created_at or 0.0)
+    recency = float(node.event_time.latest_at or 0.0)
     directness = float(node.search_directness or 0.0)
 
     if normalized == "relevance":
@@ -86,7 +90,7 @@ def _fts_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, 
     normalized = normalize_search_sort(sort)
     rank = node.search_rank
     rank_value = float(rank) if rank is not None else float("inf")
-    recency = float(node.latest_at or node.created_at or 0.0)
+    recency = float(node.event_time.latest_at or 0.0)
     directness = float(node.search_directness or 0.0)
 
     if normalized == "relevance":
@@ -104,7 +108,7 @@ def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
     rank = node.search_rank
     rank_value = float(rank) if rank is not None else float("inf")
     if normalized == "hybrid":
-        recency = float(node.latest_at or node.created_at or 0.0)
+        recency = float(node.event_time.latest_at or 0.0)
         age_hours = max(0.0, (time.time() - recency) / 3600.0)
         strength = (-rank_value) if rank is not None else float("-inf")
         blended_strength = strength / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("-inf")
@@ -154,6 +158,7 @@ class SummaryNode:
     expand_hint: str = ""  # "Expand for details about: ..."
     search_rank: float | None = None
     search_directness: float = 0.0
+    event_time: EventTimeCoverage = field(default_factory=lambda: EventTimeCoverage(legacy_count=1))
 
 
 class SummaryDAG:
@@ -222,6 +227,7 @@ class SummaryDAG:
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_window_columns()
+        ensure_event_time_schema(self._conn)
         self._conn.commit()
 
     def _ensure_source_window_columns(self) -> None:
@@ -271,6 +277,9 @@ class SummaryDAG:
                     node.latest_at,
                     node.expand_hint,
                 ),
+            )
+            node.event_time = publish_event_time(
+                self._conn, cur.lastrowid, node.source_ids, node.source_type,
             )
             self._conn.commit()
             node.node_id = cur.lastrowid
@@ -362,6 +371,9 @@ class SummaryDAG:
                     (node.session_id, node.depth, node.summary, node.token_count,
                      node.source_token_count, json.dumps(node.source_ids), node.source_type,
                      node.created_at or time.time(), node.earliest_at, node.latest_at, node.expand_hint),
+                )
+                node.event_time = publish_event_time(
+                    conn, cur.lastrowid, node.source_ids, node.source_type,
                 )
                 if conversation_id and frontier_store_id is not None:
                     updated = conn.execute(
@@ -710,7 +722,7 @@ class SummaryDAG:
         if requires_like_fallback(query, safe_query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
-        order_by = _build_search_order_by(sort, "COALESCE(n.latest_at, n.created_at)")
+        order_by = _build_search_order_by(sort, f"COALESCE({event_bound_sql('latest_at', 'n')}, 0)")
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
         candidate_cap = compute_search_candidate_cap(limit)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
@@ -989,6 +1001,8 @@ class SummaryDAG:
             "num_sources": len(node.source_ids),
             "earliest_at": node.earliest_at,
             "latest_at": node.latest_at,
+            "storage_time_basis": "ingested_at",
+            "event_time": node.event_time.as_dict(),
             "expand_hint": node.expand_hint,
             "children": children,
         }
@@ -1010,6 +1024,7 @@ class SummaryDAG:
             latest_at=row[10],
             expand_hint=row[11] or "",
             search_rank=row[12] if len(row) > 12 else None,
+            event_time=read_event_time(self._conn, row[0]),
         )
 
     def close(self) -> None:

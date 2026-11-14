@@ -30,6 +30,7 @@ from .diagnostics import (
     doctor_guidance_for_checks,
 )
 from .dag import build_nodes_fts_spec
+from .event_time import message_time_fields as _message_time_fields, read_event_time, scope_time_status
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
@@ -1598,7 +1599,7 @@ def _collect_raw_match_context_block(
             "session_id": row.get("session_id") or "",
             "source": row.get("source") or "",
             "role": row.get("role"),
-            "timestamp": row.get("timestamp", 0),
+            **_message_time_fields(row),
             **content_slice,
             "content_source": "raw_search_hit",
             "search_rank": row.get("search_rank"),
@@ -1781,7 +1782,7 @@ def _serialize_loaded_message(
         "session_id": stored_session_id,
         "source": row.get("source") or "",
         "role": row.get("role"),
-        "timestamp": row.get("timestamp", 0),
+        **_message_time_fields(row),
         "content": content_slice["content"],
         "content_chars": content_slice["content_chars"],
         "content_returned_chars": content_slice["content_returned_chars"],
@@ -1991,8 +1992,8 @@ def _session_has_window_content(
                 SELECT 1
                 FROM summary_nodes
                 WHERE session_id = ?
-                  AND COALESCE(earliest_at, created_at) < ?
-                  AND COALESCE(latest_at, created_at) >= ?
+                  AND (SELECT et.earliest_at FROM summary_event_time et WHERE et.node_id = summary_nodes.node_id) < ?
+                  AND (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = summary_nodes.node_id) >= ?
                 LIMIT 1
                 """,
                 (session_id, window.end.timestamp(), window.start.timestamp()),
@@ -2011,6 +2012,9 @@ def _recent_ready_rollups(
         return [], "subday_window"
     if not engine._config.temporal_rollups_enabled:
         return [], "temporal_rollups_disabled"
+    status = scope_time_status(engine._dag.connection, _recent_conversation_scope_session_ids(engine))
+    if status["unknown_summary_nodes"] or status["mixed_summary_nodes"]:
+        return [], "source_event_time_incomplete"
 
     # Rollups are session-scoped, but the leaf fallback spans the whole
     # conversation family (current + last-finalized session). Only serve rollups
@@ -2041,6 +2045,8 @@ def _recent_ready_rollups(
         )
         if not rollups:
             return [], "rollups_unavailable"
+        if any(row.get("time_basis") != "observed_at_v1" for row in rollups):
+            return [], "rollup_event_time_unverified"
         return rollups, None
     except Exception:
         logger.debug("LCM recent rollup read failed; using leaf summaries", exc_info=True)
@@ -2115,8 +2121,8 @@ def _recent_leaf_sections_staged(
     # window content and must be returned (maintainer #389: overlap, not
     # latest_at). Overlap = earliest < window.end AND latest >= window.start.
     where = [
-        "COALESCE(earliest_at, created_at) < ?",
-        "COALESCE(latest_at, created_at) >= ?",
+        "(SELECT et.earliest_at FROM summary_event_time et WHERE et.node_id = summary_nodes.node_id) < ?",
+        "(SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = summary_nodes.node_id) >= ?",
     ]
     params: list[object] = [window.end.timestamp(), window.start.timestamp()]
     if requested_scope == "conversation":
@@ -2164,11 +2170,11 @@ def _recent_leaf_sections_staged(
                     SELECT node.node_id, node.session_id, node.summary,
                            node.token_count, node.depth, node.source_ids,
                            node.source_type,
-                           COALESCE(node.earliest_at, node.created_at) AS earliest_at,
-                           COALESCE(node.latest_at, node.created_at) AS latest_at
+                           (SELECT et.earliest_at FROM summary_event_time et WHERE et.node_id = node.node_id) AS earliest_at,
+                           (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = node.node_id) AS latest_at
                     FROM temp.lcm_recent_frontier_ids wanted
                     JOIN summary_nodes node ON node.node_id = wanted.node_id
-                    ORDER BY COALESCE(node.latest_at, node.created_at) DESC,
+                    ORDER BY (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id = node.node_id) DESC,
                              node.node_id DESC
                     """
                 ).fetchall()
@@ -2231,6 +2237,7 @@ def _recent_leaf_sections_staged(
             "token_count": int(row[3] or 0),
             "earliest_at": row[7],
             "latest_at": row[8],
+            "event_time": read_event_time(connection, int(row[0])).as_dict(),
             "content": str(row[2] or ""),
             "content_truncated": False,
         }
@@ -2342,6 +2349,9 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
 
     rollup_scope = engine.current_session_id
     rollups, fallback_reason = _recent_ready_rollups(engine, window, rollup_scope)
+    time_status = scope_time_status(
+        engine._dag.connection, _recent_conversation_scope_session_ids(engine),
+    )
     fallback = not rollups
     if fallback:
         sections = _recent_leaf_sections(engine, window, requested_scope, limit)
@@ -2365,6 +2375,8 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
         # (maintainer #389 C2).
         "provenance": {"fallback": fallback},
         "rollups_covered": len(rollups),
+        "event_time_coverage": time_status,
+        "time_filter_note": "Unknown event dates are excluded; mixed summaries show only their known date range.",
     }
     if fallback_reason is not None:
         response["fallback_reason"] = fallback_reason
@@ -3312,6 +3324,8 @@ def _lcm_grep_semantic(
             "expand_hint": node.expand_hint,
             "earliest_at": node.earliest_at,
             "latest_at": node.latest_at,
+            "storage_time_basis": "ingested_at",
+            "event_time": node.event_time.as_dict(),
             "from_current_session": has_current_session and node.session_id == current_session_id,
             "score": score,
             "cosine_score": score,
@@ -4256,7 +4270,7 @@ def _lcm_recall_fts_arm(
             "session_id": row.get("session_id"),
             "source": row.get("source") or "",
             "role": row.get("role"),
-            "timestamp": row.get("timestamp") or 0,
+            **_message_time_fields(row),
             "content_offset": 0,
             "snippet": (row.get("snippet") or "")[:_LCM_RECALL_SNIPPET_CHARS],
             "from_current_session": bool(row.get("from_current_session")),
@@ -4395,7 +4409,7 @@ def _lcm_recall_summary_source_hits(
                 "session_id": session_id,
                 "source": row.get("source") or "",
                 "role": row.get("role"),
-                "timestamp": row.get("timestamp") or 0,
+                **_message_time_fields(row),
                 # The excerpt is the row's own prefix, so offset 0 is the truth
                 # here rather than the fabricated default a consumer would guess.
                 "content_offset": 0,
@@ -4480,7 +4494,8 @@ def _lcm_recall_summary_arm(
             "node_id": node.node_id,
             "store_id": source_store_id,
             "session_id": node.session_id,
-            "timestamp": node.latest_at or node.created_at or 0,
+            "timestamp": node.event_time.latest_at,
+            "event_time": node.event_time.as_dict(),
             "snippet": (node.summary or "")[:_LCM_RECALL_SNIPPET_CHARS],
             "from_current_session": bool(current) and node.session_id == current,
         }
@@ -5553,7 +5568,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "source": stored.get("source") or "",
             "conversation_id": stored.get("conversation_id") or "",
             "role": stored.get("role"),
-            "timestamp": stored.get("timestamp", 0),
+            **_message_time_fields(stored),
             "tool_call_id": stored.get("tool_call_id") or "",
             "from_current_session": bool(engine_session_id) and stored_session_id == engine_session_id,
             "content": sliced["content"],
@@ -6043,7 +6058,7 @@ def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
         "source": row.get("source") or "",
         "conversation_id": row.get("conversation_id") or "",
         "role": row.get("role") or "unknown",
-        "timestamp": row.get("timestamp", 0),
+        **_message_time_fields(row),
         "token_estimate": row.get("token_estimate", 0),
         "content_chars": len(content),
     }
@@ -6264,7 +6279,7 @@ def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int)
                 "source": row.get("source") or "",
                 "conversation_id": row.get("conversation_id") or "",
                 "role": row.get("role") or "unknown",
-                "timestamp": row.get("timestamp", 0),
+                **_message_time_fields(row),
                 "readable": metadata.get("readable") is True,
             }
             if row.get("tool_call_id"):
@@ -6461,6 +6476,8 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "created_at": row[6],
             "earliest_at": row[7],
             "latest_at": row[8],
+            "storage_time_basis": "ingested_at",
+            "event_time": read_event_time(engine._dag.connection, int(row[0])).as_dict(),
             "expand_hint_available": bool(row[9]),
             "expand_hint_chars": len(row[9] or ""),
         }

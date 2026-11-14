@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -22,8 +23,8 @@ Options:
   -h, --help    Show this help.
 
 Environment:
-  PYTHON=/path/to/python  Python interpreter to use for all Python gates.
-                          It must have pytest available.
+  PYTHON=/path/to/python  Host-owned interpreter with pytest available.
+  LCM_HERMES_CORE_ROOT=/path/to/core  Real Hermes Core source tree.
 EOF
 }
 
@@ -33,13 +34,8 @@ Release validation prerequisite failed: $1
 
 Using Python: $PYTHON_BIN
 
-Fix:
-  - activate a Python environment with pytest installed, or
-  - run with PYTHON=/path/to/python $0 [--full]
-
-Examples:
-  python -m pip install pytest
-  PYTHON=/path/to/venv/bin/python scripts/validate_release.sh --full
+Prepare pytest through the Hermes host's dependency manager, then use:
+  LCM_HERMES_CORE_ROOT=/path/to/core PYTHON=/path/to/host/python $0 [--full]
 EOF
   exit 2
 }
@@ -175,12 +171,6 @@ run_gate() {
   fi
 }
 
-# Release gates require a real source host. Standalone unit/benchmark ABCs
-# remain available for isolated development, but cannot certify replay budgets.
-: "${LCM_HERMES_CORE_ROOT:?Set LCM_HERMES_CORE_ROOT to the Hermes Core source tree}"
-export PYTHONPATH="$LCM_HERMES_CORE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export HERMES_LCM_HOST_ROOT="$LCM_HERMES_CORE_ROOT"
-"$PYTHON_BIN" -c 'from agent.context_engine import ContextEngine; from agent.message_sanitization import native_anthropic_row_costs; from agent.replayed_reasoning import codex_reasoning_replay_tokens'
 
 run_pytest() {
   "$PYTHON_BIN" -m pytest "$@"
@@ -206,6 +196,21 @@ if [[ -n "$DIFF_CHECK_RANGE" ]]; then
 else
   run_gate "git diff check" git diff --check
 fi
+# Release gates require a real source host. Standalone unit/benchmark ABCs
+# remain available for isolated development, but cannot certify replay budgets.
+: "${LCM_HERMES_CORE_ROOT:?Set LCM_HERMES_CORE_ROOT to the Hermes Core source tree}"
+export PYTHONPATH="$LCM_HERMES_CORE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HERMES_LCM_HOST_ROOT="$LCM_HERMES_CORE_ROOT"
+"$PYTHON_BIN" - "$LCM_HERMES_CORE_ROOT" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]).resolve(strict=True)))
+from agent.context_engine import ContextEngine
+from agent.message_sanitization import native_anthropic_row_costs
+from agent.replayed_reasoning import codex_reasoning_replay_tokens
+PY
+
+
 run_gate "dependency contract" "$PYTHON_BIN" scripts/validate_dependency_contract.py --report-environment
 run_gate "python compileall" "$PYTHON_BIN" -m compileall -q .
 run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/backfill_externalized_tool_outputs.py scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py scripts/validate_dependency_contract.py

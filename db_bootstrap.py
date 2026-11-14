@@ -460,10 +460,16 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
         if not set(expected).issubset(actual) or not actual.issubset(set(expected) | optional):
             return VERSION_MISMATCH_GENUINELY_NEWER
 
+    # Additive event-time side tables preserve the v5 core column contract.
+    # Only their exact declared shapes qualify for an interim-stamp repair.
+    from .event_time import EVENT_TIME_TABLE_COLUMNS, verify_event_time_columns
+    if not verify_event_time_columns(conn):
+        return VERSION_MISMATCH_GENUINELY_NEWER
+
     # Any extra table must belong to a known feature family or be an FTS5 shadow.
     # The feature table's *internal* shape is intentionally NOT checked here — an
     # early-variant feature table is still an interim stamp, repaired on apply.
-    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY)
+    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY) | set(EVENT_TIME_TABLE_COLUMNS)
     for fts in _V5_CORE_PRESENCE_ONLY:
         allowed.update(get_fts_shadow_table_names(fts))
     for table in tables:

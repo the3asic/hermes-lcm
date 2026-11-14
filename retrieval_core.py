@@ -25,6 +25,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
+from .event_time import message_time_fields
+
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
@@ -153,7 +155,7 @@ def _shape_message_hit(
     has_current_session: bool,
 ) -> dict[str, Any]:
     """Shape a raw MessageStore hit into an lcm_grep result row."""
-    timestamp_value = hit.get("timestamp", 0) or 0
+    timestamp_value = hit.get("observed_at") or 0
     return {
         "type": "message",
         "depth": "raw",
@@ -162,7 +164,7 @@ def _shape_message_hit(
         "source": hit.get("source") or "",
         "conversation_id": hit.get("conversation_id") or "",
         "role": hit["role"],
-        "timestamp": timestamp_value,
+        **message_time_fields(hit),
         "snippet": hit.get("snippet", hit.get("content", "")[:200]),
         "from_current_session": has_current_session
         and hit["session_id"] == current_session_id,
@@ -184,8 +186,10 @@ def _shape_summary_hit(node: Any) -> dict[str, Any]:
         "expand_hint": node.expand_hint,
         "earliest_at": node.earliest_at,
         "latest_at": node.latest_at,
+        "storage_time_basis": "ingested_at",
+        "event_time": node.event_time.as_dict(),
         "from_current_session": True,
-        "_sort_ts": node.latest_at or node.created_at,
+        "_sort_ts": node.event_time.latest_at or 0,
         "_sort_rank": node.search_rank,
         "_sort_directness": node.search_directness or 0.0,
     }
@@ -390,7 +394,7 @@ def hydrate_chunk_hits(
                 f"""
                 SELECT cm.chunk_id, cm.store_id, cm.chunk_index, cm.char_start,
                        cm.char_end, m.session_id, m.source, m.role, m.timestamp,
-                       m.content
+                       m.content, m.observed_at, m.ingested_at
                 FROM lcm_chunk_meta cm
                 JOIN messages m ON m.store_id = cm.store_id
                 WHERE cm.chunk_id IN ({placeholders}) AND cm.archived = 0
@@ -413,7 +417,7 @@ def hydrate_chunk_hits(
                 "session_id": row["session_id"],
                 "source": row["source"] or "",
                 "role": row["role"],
-                "timestamp": row["timestamp"] or 0,
+                **message_time_fields(dict(row)),
                 "chunk_span": {
                     "chunk_index": int(row["chunk_index"]),
                     "char_start": char_start,

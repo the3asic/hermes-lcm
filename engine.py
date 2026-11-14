@@ -378,9 +378,8 @@ _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 # Canonical provider-visible message keys. Overflow recovery rebuilds the
 # active context from these only; every other key on an incoming message is
 # transport-replayed provider metadata (``reasoning``, ``codex_reasoning_items``,
-# ``codex_message_items``, ...) that count_message_tokens deliberately does
-# not model — keeping it would break the recovery cap in the provider-visible
-# payload (PR #533 review).
+# ``codex_message_items``, ...). Recovery intentionally removes retained
+# reasoning as well as its stamp before budgeting the rebuilt wire payload.
 _RECOVERY_CANONICAL_MESSAGE_KEYS = (
     "role",
     "name",
@@ -2042,6 +2041,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         "source_type": "messages",
                         "store_ids": source_store_ids,
                         "message_count": len(attempt_chunk),
+                        "event_time": self._store.get_event_time_coverage(source_store_ids),
+                        "time_basis": "observed_at; ingested_at records storage only",
                     },
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
@@ -5659,7 +5660,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Serialize messages into labeled text for the summarizer."""
         parts = []
         matched_tool_ids = _matched_tool_call_ids(messages)
+        source_ids = self._get_store_id_map_for_messages(messages) if self._store is not None else {}
+        source_times = {
+            row["store_id"]: row for row in self._store.get_source_times(list(source_ids.values()))
+        } if source_ids else {}
         for msg in messages:
+            store_id = source_ids.get(id(msg))
+            source_time = source_times.get(store_id, {}).get("observed_at_utc") or "unknown"
+            source_label = f"[Source store_id={store_id}; event_time={source_time}] " if store_id is not None else ""
             role = msg.get("role", "unknown")
             content = redact_sensitive_value(
                 msg.get("content") or "",
@@ -5681,7 +5689,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     content = sanitize_pre_compaction_content(content)
                     if len(content) > 3000:
                         content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
+                parts.append(f"[TOOL RESULT {tool_id}]: {source_label}{content}")
                 continue
 
             content = sanitize_pre_compaction_content(content)
@@ -5716,12 +5724,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                 args = args[:400] + "..."
                             tc_parts.append(f"  {name}({args})")
                     content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
+                parts.append(f"[ASSISTANT]: {source_label}{content}")
                 continue
 
             if len(content) > 3000:
                 content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-            parts.append(f"[{role.upper()}]: {content}")
+            parts.append(f"[{role.upper()}]: {source_label}{content}")
 
         return "\n\n".join(parts)
 
@@ -6144,7 +6152,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 persisted.source_type, persisted.session_id,
             ):
                 raise RuntimeError("condensation source changed before model preparation")
-        combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
+        combined_text = "\n\n---\n\n".join(
+            f"[Summary node {node.node_id}, depth {node.depth}]\n{node.summary}" for node in nodes
+        )
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
         timeout_seconds = self._config.summary_timeout_ms / 1000
@@ -6177,6 +6187,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "source_type": "summary_nodes",
                 "node_ids": [node.node_id for node in nodes],
                 "source_depth": depth,
+                "source_event_times": [
+                    {"node_id": node.node_id, **node.event_time.as_dict()} for node in nodes
+                ],
             },
         )
         earliest_at, latest_at = self._dag.get_source_time_window(
