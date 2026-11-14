@@ -110,7 +110,11 @@ class TestChunkWriteAndKnn:
         result = store.knn_chunks(
             [1.0, 0.0, 0.0, 0.0], k=5, model=MODEL, provider=PROVIDER, since=250.0,
         )
-        assert {row[0] for row in result} == {"12:0"}
+        assert list(result) == []
+        unfiltered = store.knn_chunks(
+            [1.0, 0.0, 0.0, 0.0], k=5, model=MODEL, provider=PROVIDER,
+        )
+        assert {row[0] for row in unfiltered} == {"10:0", "12:0"}
 
     def test_bounded_coverage(self, tmp_path):
         db_path = tmp_path / "lcm.db"

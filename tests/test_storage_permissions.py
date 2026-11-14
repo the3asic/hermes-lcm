@@ -323,6 +323,7 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-wal")
     sidecar.write_text("replace me", encoding="utf-8")
+    sidecar.chmod(0o644)
     target = tmp_path / "unrelated.txt"
     target.write_text("shared", encoding="utf-8")
     target.chmod(0o644)
@@ -395,6 +396,7 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
+    journal.chmod(0o644)
     real_open = os.open
     disappeared = False
 
@@ -426,6 +428,7 @@ def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
+    journal.chmod(0o644)
     real_open = os.open
     unlinked = False
 

@@ -18,6 +18,7 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages_tokens
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
+from hermes_lcm.tests.source_events import publish_dated_leaf
 from hermes_lcm.escalation import _deterministic_truncate
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.db_bootstrap import (
@@ -2469,6 +2470,7 @@ class TestMessageStore:
             {
                 "role": "user",
                 "content": "database migration plan database migration plan database migration plan with rollback notes",
+                "timestamp": 1_700_000_000,
             },
         )
         newer_weak = store.append(
@@ -2476,17 +2478,9 @@ class TestMessageStore:
             {
                 "role": "assistant",
                 "content": "recent status note about the database migration plan",
+                "timestamp": 1_800_000_000,
             },
         )
-        store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_700_000_000, older_strong),
-        )
-        store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_800_000_000, newer_weak),
-        )
-        store._conn.commit()
 
         recency_results = store.search(
             '"database migration plan"',
@@ -2507,21 +2501,12 @@ class TestMessageStore:
     def test_search_cjk_queries_fall_back_with_aligned_sort_modes(self, store):
         older_strong = store.append(
             "sess1",
-            {"role": "user", "content": "部署 部署 数据库迁移清单"},
+            {"role": "user", "content": "部署 部署 数据库迁移清单", "timestamp": 1_700_000_000},
         )
         newer_weak = store.append(
             "sess1",
-            {"role": "assistant", "content": "最新部署状态更新"},
+            {"role": "assistant", "content": "最新部署状态更新", "timestamp": 1_800_000_000},
         )
-        store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_700_000_000, older_strong),
-        )
-        store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_800_000_000, newer_weak),
-        )
-        store._conn.commit()
 
         recency_results = store.search("部署", session_id="sess1", limit=1, sort="recency")
         relevance_results = store.search("部署", session_id="sess1", limit=1, sort="relevance")
@@ -2532,21 +2517,12 @@ class TestMessageStore:
     def test_search_emoji_queries_fall_back_with_aligned_sort_modes(self, store):
         older_strong = store.append(
             "sess1",
-            {"role": "user", "content": "🚀 🚀 launch checklist"},
+            {"role": "user", "content": "🚀 🚀 launch checklist", "timestamp": 1_700_000_000},
         )
         newer_weak = store.append(
             "sess1",
-            {"role": "assistant", "content": "fresh 🚀 status"},
+            {"role": "assistant", "content": "fresh 🚀 status", "timestamp": 1_800_000_000},
         )
-        store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_700_000_000, older_strong),
-        )
-        store._conn.execute(
-            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-            (1_800_000_000, newer_weak),
-        )
-        store._conn.commit()
 
         recency_results = store.search("🚀", session_id="sess1", limit=1, sort="recency")
         relevance_results = store.search("🚀", session_id="sess1", limit=1, sort="relevance")
@@ -3019,18 +2995,15 @@ class TestMessageStore:
         current_ids = [
             store.append(
                 "sess1",
-                {"role": "assistant", "content": "vendoring external"},
+                {"role": "assistant", "content": "vendoring external", "timestamp": now},
             )
             for _ in range(20)
         ]
         future_id = store.append(
             "sess1",
-            {"role": "assistant", "content": "vendoring external"},
+            {"role": "assistant", "content": "vendoring external", "timestamp": future},
         )
-        for current_id in current_ids:
-            store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (now, current_id))
-        store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (future, future_id))
-        store._conn.commit()
+        assert len(current_ids) == 20
 
         results = store.search("vendoring external", session_id="sess1", limit=1, sort="hybrid")
 
@@ -4132,6 +4105,8 @@ class TestSummaryDAG:
         node = dag.get_node(node_id)
         assert node.earliest_at == 1_700_000_000
         assert node.latest_at == 1_800_000_000
+        assert node.event_time.known_count == 0
+        assert node.event_time.legacy_count == 1
 
     def test_existing_db_is_upgraded_with_summary_source_window_columns(self, tmp_path):
         db_path = tmp_path / "legacy_dag.db"
@@ -4176,22 +4151,22 @@ class TestSummaryDAG:
         dag.close()
 
     def test_search_sort_modes_apply_before_limit(self, dag):
-        older_strong = dag.add_node(SummaryNode(
+        older_strong = publish_dated_leaf(dag, SummaryNode(
             session_id="s1", depth=0,
             summary="error handling checklist error handling checklist error handling checklist with confirmed fixes",
             token_count=18, source_ids=[1], source_type="messages",
             created_at=1_700_000_000,
             earliest_at=1_700_000_000,
             latest_at=1_700_000_000,
-        ))
-        newer_weak = dag.add_node(SummaryNode(
+        ), event_times=(1_700_000_000,))
+        newer_weak = publish_dated_leaf(dag, SummaryNode(
             session_id="s1", depth=0,
             summary="recent note mentioning the error handling checklist",
             token_count=9, source_ids=[2], source_type="messages",
             created_at=1_700_086_400,
             earliest_at=1_700_086_400,
             latest_at=1_700_086_400,
-        ))
+        ), event_times=(1_700_086_400,))
 
         recency_results = dag.search(
             '"error handling checklist"',
@@ -4210,22 +4185,22 @@ class TestSummaryDAG:
         assert hybrid_results[0].node_id == older_strong
 
     def test_search_cjk_queries_fall_back_with_aligned_sort_modes(self, dag):
-        older_strong = dag.add_node(SummaryNode(
+        older_strong = publish_dated_leaf(dag, SummaryNode(
             session_id="s1", depth=0,
             summary="部署 部署 数据库迁移清单",
             token_count=12, source_ids=[1], source_type="messages",
             created_at=1_700_000_000,
             earliest_at=1_700_000_000,
             latest_at=1_700_000_000,
-        ))
-        newer_weak = dag.add_node(SummaryNode(
+        ), event_times=(1_700_000_000,))
+        newer_weak = publish_dated_leaf(dag, SummaryNode(
             session_id="s1", depth=0,
             summary="最新部署状态更新",
             token_count=8, source_ids=[2], source_type="messages",
             created_at=1_800_000_000,
             earliest_at=1_800_000_000,
             latest_at=1_800_000_000,
-        ))
+        ), event_times=(1_800_000_000,))
 
         recency_results = dag.search("部署", session_id="s1", limit=1, sort="recency")
         relevance_results = dag.search("部署", session_id="s1", limit=1, sort="relevance")
@@ -4234,22 +4209,22 @@ class TestSummaryDAG:
         assert relevance_results[0].node_id == older_strong
 
     def test_search_emoji_queries_fall_back_with_aligned_sort_modes(self, dag):
-        older_strong = dag.add_node(SummaryNode(
+        older_strong = publish_dated_leaf(dag, SummaryNode(
             session_id="s1", depth=0,
             summary="🚀 🚀 launch checklist",
             token_count=12, source_ids=[1], source_type="messages",
             created_at=1_700_000_000,
             earliest_at=1_700_000_000,
             latest_at=1_700_000_000,
-        ))
-        newer_weak = dag.add_node(SummaryNode(
+        ), event_times=(1_700_000_000,))
+        newer_weak = publish_dated_leaf(dag, SummaryNode(
             session_id="s1", depth=0,
             summary="fresh 🚀 status",
             token_count=8, source_ids=[2], source_type="messages",
             created_at=1_800_000_000,
             earliest_at=1_800_000_000,
             latest_at=1_800_000_000,
-        ))
+        ), event_times=(1_800_000_000,))
 
         recency_results = dag.search("🚀", session_id="s1", limit=1, sort="recency")
         relevance_results = dag.search("🚀", session_id="s1", limit=1, sort="relevance")

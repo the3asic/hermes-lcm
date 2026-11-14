@@ -179,6 +179,7 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
         "error": None,
         "generation": 0,
         "source_node_ids": [],
+        "time_basis": "legacy_storage",
     }
 
     assert rollup_store.mark_ready(

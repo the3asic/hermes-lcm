@@ -17,6 +17,7 @@ from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.tokens import count_tokens
+from hermes_lcm.tests.source_events import publish_dated_leaf
 
 
 @pytest.fixture
@@ -119,7 +120,8 @@ def test_rollups_rebuild_marks_all_targets_stale_and_builds_bounded(engine, monk
     scope = engine.current_session_id
     timestamp = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
     summary = "source summary for bounded rebuild"
-    node_id = engine._dag.add_node(
+    node_id = publish_dated_leaf(
+        engine._dag,
         SummaryNode(
             session_id=scope,
             depth=0,
@@ -131,7 +133,8 @@ def test_rollups_rebuild_marks_all_targets_stale_and_builds_bounded(engine, monk
             created_at=timestamp,
             earliest_at=timestamp,
             latest_at=timestamp,
-        )
+        ),
+        event_times=(timestamp,),
     )
     store = RollupStore(engine._dag.db_path)
     try:
@@ -258,7 +261,8 @@ def test_rollups_rebuild_all_durably_seeds_unattempted_targets(engine, monkeypat
     scope = engine.current_session_id
     engine._config.rollup_builds_per_pass = 1
     timestamp = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
-    engine._dag.add_node(
+    publish_dated_leaf(
+        engine._dag,
         SummaryNode(
             session_id=scope,
             depth=0,
@@ -270,7 +274,8 @@ def test_rollups_rebuild_all_durably_seeds_unattempted_targets(engine, monkeypat
             created_at=timestamp,
             earliest_at=timestamp,
             latest_at=timestamp,
-        )
+        ),
+        event_times=(timestamp,),
     )
     monkeypatch.setattr(
         builder_module,
@@ -303,7 +308,8 @@ def test_rollups_rebuild_attempted_failure_is_not_reported_complete(engine, monk
     # status to 'partial' (or error), never 'complete'.
     scope = engine.current_session_id
     timestamp = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
-    engine._dag.add_node(
+    publish_dated_leaf(
+        engine._dag,
         SummaryNode(
             session_id=scope,
             depth=0,
@@ -315,7 +321,8 @@ def test_rollups_rebuild_attempted_failure_is_not_reported_complete(engine, monk
             created_at=timestamp,
             earliest_at=timestamp,
             latest_at=timestamp,
-        )
+        ),
+        event_times=(timestamp,),
     )
 
     def boom(_text, **_kwargs):
@@ -341,7 +348,8 @@ def test_rollups_rebuild_attempted_no_source_is_not_reported_complete(engine):
 def test_rollups_rebuild_attempted_incomplete_aggregate_is_deferred(engine):
     scope = engine.current_session_id
     timestamp = datetime(2026, 7, 13, 12, tzinfo=timezone.utc).timestamp()
-    engine._dag.add_node(
+    publish_dated_leaf(
+        engine._dag,
         SummaryNode(
             session_id=scope,
             depth=0,
@@ -353,7 +361,8 @@ def test_rollups_rebuild_attempted_incomplete_aggregate_is_deferred(engine):
             created_at=timestamp,
             earliest_at=timestamp,
             latest_at=timestamp,
-        )
+        ),
+        event_times=(timestamp,),
     )
 
     result = handle_lcm_command("rollups rebuild week 2026-07-13", engine)

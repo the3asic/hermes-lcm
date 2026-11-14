@@ -13,6 +13,8 @@ from hermes_lcm.rollup_periods import parse_recent_period
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.schemas import LCM_RECENT
 from hermes_lcm.tokens import count_tokens
+from hermes_lcm.store import MessageStore
+from hermes_lcm.tests.source_events import publish_dated_leaf
 from hermes_lcm import tools as tools_module
 from hermes_lcm.tools import (
     _recent_expected_period_starts,
@@ -110,7 +112,8 @@ def _timestamp(day: date, hour: int = 12) -> float:
 
 def _add_leaf(dag, session_id, day, summary, *, timestamp=None):
     content_time = timestamp if timestamp is not None else _timestamp(day)
-    return dag.add_node(
+    return publish_dated_leaf(
+        dag,
         SummaryNode(
             session_id=session_id,
             depth=0,
@@ -122,18 +125,35 @@ def _add_leaf(dag, session_id, day, summary, *, timestamp=None):
             created_at=content_time,
             earliest_at=content_time,
             latest_at=content_time,
-        )
+        ),
+        event_times=(content_time,),
     )
 
 
-def _ready(store, kind, period_start, scope, summary="ready rollup", token_count=17):
+def _ready(store, kind, period_start, scope, summary="ready rollup", token_count=17, *, source_ids=None):
+    if source_ids is None:
+        start = datetime.combine(date.fromisoformat(period_start), datetime.min.time(), tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        source_ids = [row[0] for row in store.connection.execute(
+            "SELECT node.node_id FROM summary_nodes node "
+            "JOIN summary_event_time et ON et.node_id=node.node_id "
+            "WHERE node.session_id=? AND et.known_count>0 "
+            "AND et.unknown_count=0 AND et.legacy_count=0 "
+            "AND et.earliest_at<? AND et.latest_at>=?",
+            (scope, end.timestamp(), start.timestamp()),
+        )]
+    store.drain_invalidations(event_limit=256, day_budget=256)
     token = store.upsert_building(kind, period_start, scope)
-    store.mark_ready(token, summary, token_count, [], "fingerprint")
+    assert store.mark_ready(
+        token, summary, token_count, source_ids, "fingerprint",
+        time_basis="observed_at_v1" if source_ids else "legacy_storage",
+    )
     return token.rollup_id
 
 
 def test_lcm_recent_serves_ready_rollup_with_provenance(recent_parts):
     engine, store = recent_parts
+    _add_leaf(engine._dag, engine.current_session_id, date(2026, 7, 15), "ready rollup")
     rollup_id = _ready(store, "day", "2026-07-15", engine.current_session_id)
 
     result = json.loads(lcm_recent({"period": "date:2026-07-15"}, engine=engine))
@@ -163,6 +183,7 @@ def test_lcm_recent_stale_rollup_falls_back_to_leaf_summaries(recent_parts):
 
 def test_lcm_recent_fails_closed_while_invalidation_is_pending(recent_parts):
     engine, store = recent_parts
+    _add_leaf(engine._dag, engine.current_session_id, date(2026, 7, 15), "ready rollup")
     _ready(store, "day", "2026-07-15", engine.current_session_id)
 
     # The node insert and durable invalidation event commit together, but no
@@ -180,9 +201,9 @@ def test_lcm_recent_fails_closed_while_invalidation_is_pending(recent_parts):
     assert result["mode"] == "leaf_summary_fallback"
     assert result["fallback_reason"] == "rollups_invalidation_pending"
     assert result["provenance"] == {"fallback": True, "rollups": []}
-    assert [section["content"] for section in result["sections"]] == [
-        "new content awaiting rollup invalidation"
-    ]
+    assert {section["content"] for section in result["sections"]} == {
+        "new content awaiting rollup invalidation", "ready rollup",
+    }
 
 
 def test_recent_window_coverage_requires_every_day_ready(recent_parts):
@@ -195,6 +216,8 @@ def test_recent_window_coverage_requires_every_day_ready(recent_parts):
     window = parse_recent_period("2d", now=NOW)  # 2026-07-14 .. 2026-07-16
     assert [d for d in _recent_expected_period_starts(window)] == ["2026-07-14", "2026-07-15"]
 
+    _add_leaf(engine._dag, scope, date(2026, 7, 14), "ready rollup")
+    _add_leaf(engine._dag, scope, date(2026, 7, 15), "ready rollup")
     _ready(store, "day", "2026-07-15", scope)  # 2026-07-14 missing entirely
     assert _recent_has_unready_rollups(store, window, scope) is True
     served, reason = _recent_ready_rollups(engine, window, scope)
@@ -331,6 +354,7 @@ def test_lcm_recent_limit_order_and_response_char_bound(recent_parts):
 
 def test_lcm_recent_conversation_scope_reports_clamped_limit(recent_parts):
     engine, store = recent_parts
+    _add_leaf(engine._dag, engine.current_session_id, date(2026, 7, 15), "ready rollup")
     rollup_id = _ready(store, "day", "2026-07-15", engine.current_session_id)
 
     result = json.loads(
@@ -575,13 +599,28 @@ def test_recent_provenance_is_bounded_to_returned_sections(recent_parts):
     scope = engine.current_session_id
     today = datetime.now(timezone.utc).date()
     days = [today - timedelta(days=offset) for offset in range(1000)]
-    with store.connection:
-        store.connection.executemany(
-            "INSERT INTO lcm_rollups(period_kind, period_start, scope, summary, "
-            "token_count, status, source_fingerprint) "
-            "VALUES('day', ?, ?, ?, ?, 'ready', ?)",
-            [(d.isoformat(), scope, f"summary for {d}", 5, f"fp-{d}") for d in days],
-        )
+    sources = MessageStore(engine._dag.db_path)
+    try:
+        source_ids = sources.append_batch(scope, [
+            {"role": "user", "content": f"summary for {day}", "timestamp": _timestamp(day)}
+            for day in days
+        ])
+        published = []
+        for day, source_id in zip(days, source_ids, strict=True):
+            node = SummaryNode(
+                session_id=scope, summary=f"summary for {day}",
+                source_ids=[source_id], source_type="messages",
+            )
+            node_id = engine._dag.publish_node(
+                node, engine._dag.publication_snapshot([source_id], "messages"),
+            )
+            published.append((day, node_id, node.summary))
+    finally:
+        sources.close()
+    while store.has_pending_invalidations(scope):
+        store.drain_invalidations(event_limit=256, day_budget=256)
+    for day, node_id, summary in published:
+        _ready(store, "day", day.isoformat(), scope, summary=summary, token_count=5, source_ids=[node_id])
 
     raw = lcm_recent({"period": "1000d", "limit": 1}, engine=engine)
     result = json.loads(raw)
@@ -603,7 +642,8 @@ def test_recent_fallback_includes_summary_overlapping_window_edge(recent_parts):
     engine._config.temporal_rollups_enabled = False  # force the leaf fallback
     scope = engine.current_session_id
     day = date(2026, 7, 15)
-    spanning_id = engine._dag.add_node(
+    spanning_id = publish_dated_leaf(
+        engine._dag,
         SummaryNode(
             session_id=scope,
             depth=0,
@@ -615,7 +655,8 @@ def test_recent_fallback_includes_summary_overlapping_window_edge(recent_parts):
             created_at=_timestamp(day, 23),
             earliest_at=_timestamp(day, 23),
             latest_at=_timestamp(date(2026, 7, 16), 1),
-        )
+        ),
+        event_times=(_timestamp(day, 23), _timestamp(date(2026, 7, 16), 1)),
     )
 
     result = json.loads(lcm_recent({"period": "date:2026-07-15"}, engine=engine))
@@ -646,16 +687,27 @@ def test_recent_fallback_candidate_work_is_sql_bounded(recent_parts, monkeypatch
         )
         for index in range(tools_module._LCM_RECENT_FRONTIER_WORK_LIMIT + 1)
     ]
-    for node in rows:
-        engine._dag.add_node(node)
+    sources = MessageStore(engine._dag.db_path)
+    try:
+        source_ids = sources.append_batch(scope, [
+            {"role": "user", "content": node.summary, "timestamp": content_time}
+            for node in rows
+        ])
+        for node, source_id in zip(rows, source_ids, strict=True):
+            node.source_ids = [source_id]
+            engine._dag.publish_node(
+                node, engine._dag.publication_snapshot([source_id], "messages"),
+            )
+    finally:
+        sources.close()
 
     probe_plan = engine._dag.connection.execute(
         """
         EXPLAIN QUERY PLAN
         SELECT node_id
         FROM summary_nodes
-        WHERE COALESCE(earliest_at, created_at) < ?
-          AND COALESCE(latest_at, created_at) >= ?
+        WHERE (SELECT et.earliest_at FROM summary_event_time et WHERE et.node_id=summary_nodes.node_id) < ?
+          AND (SELECT et.latest_at FROM summary_event_time et WHERE et.node_id=summary_nodes.node_id) >= ?
           AND session_id IN (?)
         LIMIT ?
         """,

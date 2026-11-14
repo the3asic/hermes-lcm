@@ -24,6 +24,7 @@ from hermes_lcm.rollup_builder import (
 )
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.tokens import count_tokens
+from hermes_lcm.tests.source_events import publish_dated_leaf
 
 
 @pytest.fixture
@@ -58,7 +59,8 @@ def _add_node(
     latest_day: date | None = None,
 ) -> int:
     latest = latest_day or day
-    return dag.add_node(
+    return publish_dated_leaf(
+        dag,
         SummaryNode(
             session_id=scope,
             depth=depth,
@@ -70,7 +72,8 @@ def _add_node(
             created_at=_timestamp(day, 18),
             earliest_at=_timestamp(day, 8),
             latest_at=_timestamp(latest, 22),
-        )
+        ),
+        event_times=(_timestamp(day, 8), _timestamp(latest, 22)),
     )
 
 
@@ -86,12 +89,13 @@ def _ready(
 ) -> int:
     store.drain_invalidations(event_limit=256, day_budget=256)
     token = store.upsert_building(kind, start, scope)
-    store.mark_ready(
+    assert store.mark_ready(
         token,
         summary,
         count_tokens(summary),
         source_ids,
         fingerprint,
+        time_basis="observed_at_v1",
     )
     return token.rollup_id
 
@@ -1180,7 +1184,7 @@ def test_daily_frontier_does_not_duplicate_multiday_parent_lineage(rollup_parts)
     scope = "session-b1"
     jul15 = date(2026, 7, 15)
     jul16 = date(2026, 7, 16)
-    child = _add_node(dag, scope, jul15, "child leaf covering jul15")
+    child = _add_node(dag, scope, jul15, "child leaf covering jul15", latest_day=jul16)
     parent = dag.add_node(
         SummaryNode(
             session_id=scope,
@@ -1477,13 +1481,13 @@ def test_scope_frontier_never_enumerates_a_nodes_centuries_long_interval(
     )
     assert not hasattr(periods_module, "covered_days")
 
-    sources = builder_module._daily_sources(dag, scope, date(2026, 7, 15))
-    content_days = builder_module._days_with_content(
-        dag, scope, date(2026, 7, 1), date(2026, 7, 31)
-    )
-
-    assert [source["node_id"] for source in sources] == [node_id]
-    assert len(content_days) == 31
+    assert dag.get_node(node_id).event_time.known_count == 0
+    with pytest.raises(ValueError, match="unknown or mixed source event time"):
+        builder_module._daily_sources(dag, scope, date(2026, 7, 15))
+    with pytest.raises(ValueError, match="unknown or mixed source event time"):
+        builder_module._days_with_content(
+            dag, scope, date(2026, 7, 1), date(2026, 7, 31),
+        )
 
 
 def test_source_lineage_walk_stops_near_limit_instead_of_materializing_closure(

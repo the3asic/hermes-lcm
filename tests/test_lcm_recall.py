@@ -273,13 +273,16 @@ def test_scope_bias_boosts_current_conversation_without_filtering(recall_engine,
 def test_recency_boost_moves_ranking(recall_engine, monkeypatch):
     old_strong = _add_summary(recall_engine, "old kanban board", session_id="session-a", created_at=1.0, latest_at=1.0)
     new_weak = _add_summary(recall_engine, "new kanban board", session_id="session-b", created_at=1.0, latest_at=time.time())
-    # old_strong scores higher on cosine (rank 1) but is ancient; new_weak is rank 2 but fresh.
+    # Neither summary has source event dates; creation/storage windows must
+    # not give either one an event-recency boost.
     _seed_summary_vectors(recall_engine, [(old_strong, [1.0, 0.0]), (new_weak, [0.95, 0.312])])
 
     payload = _recall(recall_engine, monkeypatch, include="summaries", scope_bias=0.0, limit=5)
 
-    assert payload["hits"][0]["node_id"] == new_weak
-    assert old_strong in {h["node_id"] for h in payload["hits"]}
+    assert payload["hits"][0]["node_id"] == old_strong
+    assert new_weak in {h["node_id"] for h in payload["hits"]}
+    assert all(recall_engine._dag.get_node(node_id).event_time.known_count == 0
+               for node_id in (old_strong, new_weak))
 
 
 def test_chunk_hit_dedupes_against_fts_by_store_id(recall_engine, monkeypatch):

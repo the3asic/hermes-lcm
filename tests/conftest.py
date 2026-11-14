@@ -43,7 +43,10 @@ if _host_root:
         raise RuntimeError("LCM_HERMES_CORE_ROOT is not a Hermes Core source tree")
     sys.path.insert(0, str(_host_path))
     from agent.context_engine import ContextEngine
+    from agent.message_sanitization import native_anthropic_row_costs
+    from agent.replayed_reasoning import codex_reasoning_replay_tokens
     assert ContextEngine is not None
+    assert callable(native_anthropic_row_costs) and callable(codex_reasoning_replay_tokens)
     if Path(sys.modules["agent.context_engine"].__file__).resolve() != _host_path / "agent/context_engine.py":
         raise RuntimeError("A different ContextEngine was imported before the real host")
 else:

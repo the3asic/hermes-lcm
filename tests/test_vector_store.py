@@ -12,6 +12,7 @@ import pytest
 from hermes_lcm import db_bootstrap
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
+from hermes_lcm.tests.source_events import publish_dated_leaf
 from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 import hermes_lcm.vector_store as vector_store_module
 
@@ -51,17 +52,19 @@ def _add_summary(
     session_id: str = "conversation-a",
     source_token_count: int = 100,
     created_at: float = 1.0,
+    event_time: float | None = None,
 ) -> int:
-    return dag.add_node(
-        SummaryNode(
-            session_id=session_id,
-            summary=f"summary for {session_id} at {created_at}",
-            source_token_count=source_token_count,
-            created_at=created_at,
-            earliest_at=created_at,
-            latest_at=created_at,
-        )
+    node = SummaryNode(
+        session_id=session_id,
+        summary=f"summary for {session_id} at {created_at}",
+        source_token_count=source_token_count,
+        created_at=created_at,
+        earliest_at=created_at,
+        latest_at=created_at,
     )
+    if event_time is None:
+        return dag.add_node(node)
+    return publish_dated_leaf(dag, node, event_times=(event_time,))
 
 
 def _record_embedding(
@@ -783,9 +786,9 @@ def test_suppressed_summaries_are_filtered_and_purge_removes_embeddings(stores):
 
 def test_filter_overfetch_uses_summary_time_and_session_columns(stores):
     dag, store = stores
-    old_a = _add_summary(dag, session_id="conversation-a", created_at=10.0)
-    new_a = _add_summary(dag, session_id="conversation-a", created_at=20.0)
-    new_b = _add_summary(dag, session_id="conversation-b", created_at=30.0)
+    old_a = _add_summary(dag, session_id="conversation-a", created_at=10.0, event_time=10.0)
+    new_a = _add_summary(dag, session_id="conversation-a", created_at=20.0, event_time=20.0)
+    new_b = _add_summary(dag, session_id="conversation-b", created_at=30.0, event_time=30.0)
     store.register_profile("filters", "local", 3)
     _record_embedding(store, old_a, "summary", "filters", [1.0, 0.0, 0.0])
     _record_embedding(store, new_a, "summary", "filters", [0.9, 0.1, 0.0])
@@ -872,9 +875,9 @@ def test_time_to_filter_excludes_before_top_k(stores):
     store.register_profile("time-to", "local", 2)
     # 501 high-scoring but too-new vectors must not consume the top-k slots.
     for index in range(501):
-        too_new = _add_summary(dag, created_at=10_000.0 + index)
+        too_new = _add_summary(dag, created_at=10_000.0 + index, event_time=10_000.0 + index)
         _record_embedding(store, too_new, "summary", "time-to", [1.0, 0.0])
-    eligible = _add_summary(dag, created_at=5.0)
+    eligible = _add_summary(dag, created_at=5.0, event_time=5.0)
     _record_embedding(store, eligible, "summary", "time-to", [0.0, 1.0])
 
     result = store.knn([1.0, 0.0], k=2, model="time-to", until=100.0)

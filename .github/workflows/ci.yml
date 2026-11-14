@@ -55,9 +55,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install test dependencies
-        run: pip install pytest numpy PyYAML==6.0.3
-
       - name: Check out the observed Hermes host
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -69,20 +66,27 @@ jobs:
         working-directory: artifacts/hermes-core
         run: python -m pm.build_env --source . --out .venv --python "$(command -v python)" --group test --group dev --requirement numpy --requirement PyYAML --requirement tiktoken
 
-      - name: Run pytest with the real host under low file descriptor limit
+      - name: Run isolated regressions with the real host under low file descriptor limit
         env:
           LCM_HERMES_CORE_ROOT: ${{ github.workspace }}/artifacts/hermes-core
           HERMES_LCM_HOST_ROOT: ${{ github.workspace }}/artifacts/hermes-core
+          PYTHONPATH: ${{ github.workspace }}/artifacts/hermes-core
+          HERMES_HOME: ${{ github.workspace }}/artifacts/dev-home
+          TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/tiktoken-cache
         run: |
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/hermes-core/.venv/bin/python"
+          "$PYTHON" -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")'
+          "$PYTHON" scripts/validate_release_host.py --core-root "$LCM_HERMES_CORE_ROOT"
           ulimit -n 1024
-          artifacts/hermes-core/.venv/bin/python -m pytest tests/ -q
+          "$PYTHON" -m pytest tests/ -q
 
       - name: Run static validation
         run: |
-          python scripts/validate_dependency_contract.py
-          python -m compileall -q -x '/artifacts/' .
-          python -m py_compile scripts/import_lossless_claw.py
-          bash -n scripts/install.sh scripts/update.sh
+          PYTHON="${GITHUB_WORKSPACE}/artifacts/hermes-core/.venv/bin/python"
+          "$PYTHON" scripts/validate_dependency_contract.py
+          "$PYTHON" -m compileall -q -x '/artifacts/' .
+          "$PYTHON" -m py_compile scripts/import_lossless_claw.py scripts/validate_release_host.py
+          bash -n scripts/install.sh scripts/update.sh scripts/validate_release.sh
           git diff --check
 
   test-macos-paths:
