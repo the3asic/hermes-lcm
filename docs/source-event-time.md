@@ -2,8 +2,11 @@
 
 A raw message's `observed_at` is its validated source/host timestamp.
 `observed_at_source` identifies that source. A missing timestamp stays unknown.
-`ingested_at` and the historical `timestamp` column record the LCM write time.
-They can be days later than the event and never establish an event date.
+`ingested_at` records the LCM write time, which can be days after the event.
+The historical `timestamp` column retains the owning writer's compatibility
+meaning: normal ingest stores write time, while imported records may retain the
+export's timestamp or an explicit legacy fallback. Neither field establishes an
+event date.
 
 New summaries publish their source-event coverage to `summary_event_time` in
 one transaction with the summary and any lifecycle frontier. Leaves aggregate
@@ -25,7 +28,9 @@ Unknown event dates cannot satisfy a date filter and sort after known dates.
 Raw result `timestamp` is the event timestamp or null; `ingested_at` remains
 available explicitly. Summary/vector time filtering uses event-range overlap;
 unknown coverage is excluded. No branch substitutes a write/creation date for
-an event date.
+an event date. Ordinary recall leaves the relevance of an unknown-date hit
+unchanged; a missing date is neither a recency claim nor an automatic relevance
+penalty.
 
 `lcm_recent` selects event ranges that overlap the requested UTC window. Its
 response identifies unknown and mixed summary coverage in the requested
@@ -50,6 +55,21 @@ its own database. Opening does not backfill old `observed_at`, recompute old
 summary coverage, rebuild old rollups or upgrade historical permissions.
 Coverage recomputation for existing summaries is a separate database operation
 requiring its own source-identity, recovery and authorization review.
+
+New Lossless Claw SQLite imports preserve a message's explicit `created_at`
+using the source export's UTC convention. A missing or invalid message date
+stays unknown even when legacy ordering falls back to a conversation's creation
+time. JSONL imports accept the normal host timestamp forms: positive finite Unix
+seconds or timezone-aware ISO-8601. Each imported row records its import time
+separately and labels the source of any known event date. Imported summaries
+publish coverage from their resolved raw-message or child-summary sources in
+the same import transaction. Reopening an old import does not certify its
+existing rows or regenerate summaries.
+
+Interim schema-stamp remediation preserves recognized event-time side tables.
+Their exact shape is checked before any derived-family repair; unknown shapes
+remain a refusal. Rebuilding a separate feature cache cannot serve as evidence
+that a historical event date has been established.
 
 Before release, prove both readers against an offline candidate: the selected
 Core/LCM pair must publish and reopen known, unknown and mixed coverage; an

@@ -10,6 +10,10 @@ from dataclasses import asdict, dataclass
 import sqlite3
 from typing import Iterable
 
+ROLLUP_EVENT_TIME_TRIGGERS = (
+    'lcm_event_time_node_update', 'lcm_event_time_insert', 'lcm_event_time_delete',
+)
+
 EVENT_TIME_TABLE_COLUMNS = {
     'summary_event_time': {'node_id', 'earliest_at', 'latest_at', 'known_count', 'unknown_count', 'legacy_count'},
     'lcm_rollup_event_time': {'rollup_id', 'source_fingerprint'},
@@ -89,7 +93,10 @@ def ensure_event_time_schema(conn: sqlite3.Connection) -> None:
     # The existing outbox is owned by the rollup schema. Its storage-time
     # invalidations remain useful to old code. Event-time invalidations augment
     # them in the SAME publication transaction, including deletion/lineage edits.
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='lcm_rollup_invalidations'").fetchone():
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='lcm_rollup_invalidations'").fetchone():
+        for trigger in ROLLUP_EVENT_TIME_TRIGGERS:
+            conn.execute(f'DROP TRIGGER IF EXISTS {trigger}')
+    else:
         conn.execute("""
             CREATE TRIGGER IF NOT EXISTS lcm_event_time_node_update
             AFTER UPDATE OF session_id, summary, token_count, source_token_count,

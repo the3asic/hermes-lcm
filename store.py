@@ -1631,8 +1631,9 @@ class MessageStore:
                 if len(rows) < batch_limit:
                     break
                 if scanned_rows >= candidate_cap:
-                    boundary_timestamp = rows[-1][8]
-                    boundary_role_bias = _message_role_bias(rows[-1][3])
+                    boundary = self._row_to_dict(rows[-1])
+                    boundary_timestamp = boundary["observed_at"]
+                    boundary_role_bias = _message_role_bias(boundary["role"])
                     while True:
                         tie_rows = self._conn.execute(
                             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
@@ -1647,7 +1648,9 @@ class MessageStore:
                         matching_tie_rows = []
                         reached_next_primary_group = False
                         for tie_row in tie_rows:
-                            if tie_row[8] == boundary_timestamp and _message_role_bias(tie_row[3]) == boundary_role_bias:
+                            tie_result = self._row_to_dict(tie_row)
+                            if (tie_result["observed_at"] == boundary_timestamp
+                                    and _message_role_bias(tie_result["role"]) == boundary_role_bias):
                                 matching_tie_rows.append(tie_row)
                             else:
                                 reached_next_primary_group = True
@@ -1681,14 +1684,14 @@ class MessageStore:
             if normalized_sort == "hybrid":
                 primary_expr = (
                     f"(({score_expr}) / (1 + (MAX(0.0, "
-                    f"((strftime('%s','now') - timestamp) / 3600.0)) * {AGE_DECAY_RATE})))"
+                    f"((strftime('%s','now') - COALESCE(observed_at, 0.0)) / 3600.0)) * {AGE_DECAY_RATE})))"
                 )
             else:
                 primary_expr = f"({score_expr})"
 
             order_by = (
                 f"ORDER BY {primary_expr} DESC, ({exact_expr}) DESC, ({directness_expr}) DESC, "
-                f"{role_bias} ASC, timestamp DESC, store_id DESC"
+                f"{role_bias} ASC, observed_at DESC, store_id DESC"
             )
             candidate_cap = compute_search_candidate_cap(limit)
             offset = 0

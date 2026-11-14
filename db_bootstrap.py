@@ -532,7 +532,7 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
         tables = _user_table_names(conn)
     except sqlite3.DatabaseError:
         return []
-    from .event_time import EVENT_TIME_TABLE_COLUMNS, verify_event_time_columns
+    from .event_time import EVENT_TIME_TABLE_COLUMNS, ROLLUP_EVENT_TIME_TRIGGERS, verify_event_time_columns
     if not verify_event_time_columns(conn):
         raise RuntimeError("Unrecognized event-time schema cannot be remediated")
     plans: list[dict[str, object]] = []
@@ -560,6 +560,13 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
                 (prefix + "%",),
             ).fetchall()
         )
+        if prefix == "lcm_rollup":
+            triggers = sorted(set(triggers) | {
+                str(row[0]) for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN (?, ?, ?)",
+                    ROLLUP_EVENT_TIME_TRIGGERS,
+                ).fetchall()
+            })
         plans.append({
             "family": family["name"],
             "tables": present,
