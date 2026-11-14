@@ -598,8 +598,9 @@ def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
     # Early feature tables are gone; core tables remain untouched.
     remaining = _table_names(db_path)
-    assert not any(t.startswith(("lcm_rollup", "lcm_embedding")) for t in remaining)
-    assert {"messages", "summary_nodes"} <= remaining
+    assert not any(t.startswith(("lcm_rollup", "lcm_embedding"))
+                   for t in remaining - {"lcm_rollup_event_time"})
+    assert {"messages", "summary_nodes", "lcm_rollup_event_time"} <= remaining
 
     # refuse now passes, and each feature store reconstructs the final shape.
     conn = sqlite3.connect(db_path)
@@ -708,8 +709,11 @@ def test_doctor_repair_schema_stamp_dry_run_and_apply(tmp_path):
     assert f"schema_version_reset_to: {db_bootstrap.SCHEMA_VERSION}" in applied
     assert "dropped: lcm_rollups" in applied
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
+    remaining = _table_names(db_path)
+    assert "lcm_rollup_event_time" in remaining
     assert not any(
-        t.startswith(("lcm_rollup", "lcm_embedding")) for t in _table_names(db_path)
+        t.startswith(("lcm_rollup", "lcm_embedding"))
+        for t in remaining - {"lcm_rollup_event_time"}
     )
 
 

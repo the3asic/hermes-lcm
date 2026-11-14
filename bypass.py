@@ -98,7 +98,10 @@ class BypassMixin:
             self._host_fallback_session_id = ""
 
     def _get_host_fallback_compressor(self) -> Any:
-        """Return Hermes' native compressor for LCM-bypassed sessions if available."""
+        """Return the native compressor only after the host has bound a model."""
+        if not self.model:
+            logger.debug("LCM native bypass compression is unavailable before host model binding")
+            return None
         session_id = self._bypass_lcm_session_id()
         if self._host_fallback_compressor is not None:
             if session_id == self._host_fallback_session_id:

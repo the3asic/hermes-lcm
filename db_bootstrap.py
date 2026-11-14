@@ -532,10 +532,13 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
         tables = _user_table_names(conn)
     except sqlite3.DatabaseError:
         return []
+    from .event_time import EVENT_TIME_TABLE_COLUMNS, verify_event_time_columns
+    if not verify_event_time_columns(conn):
+        raise RuntimeError("Unrecognized event-time schema cannot be remediated")
     plans: list[dict[str, object]] = []
     for family in _INTERIM_FEATURE_FAMILIES:
         prefix = family["prefix"]
-        present = sorted(t for t in tables if t.startswith(prefix))
+        present = sorted(t for t in tables if t.startswith(prefix) and t not in EVENT_TIME_TABLE_COLUMNS)
         if not present:
             continue
         verify = _family_verifier(prefix)

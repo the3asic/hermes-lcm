@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -3521,13 +3522,13 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _lcm_recall_recency_boost(timestamp: Any, *, now: float) -> float:
-    """Half-life recency multiplier in ``[floor, 1.0]`` (newer => closer to 1)."""
+    """Apply known-age decay; an unknown event date leaves relevance unchanged."""
     try:
         ts = float(timestamp or 0.0)
     except (TypeError, ValueError):
         ts = 0.0
-    if ts <= 0:
-        return _LCM_RECALL_RECENCY_FLOOR
+    if not math.isfinite(ts) or ts <= 0:
+        return 1.0
     age = max(0.0, now - ts)
     boost = 2.0 ** (-(age / _LCM_RECALL_RECENCY_HALF_LIFE_S))
     return max(_LCM_RECALL_RECENCY_FLOOR, boost)
@@ -3936,6 +3937,15 @@ class _LcmRecallStrictSelector:
             return
         store_id = int(store_id)
         if self.ledger.holds_store(store_id):
+            return
+        # A rejected summary may carry the same lineage id as a citable
+        # message later in this prefetched wave. Keep that bounded read until
+        # the message is examined; the prefetch cursor has already passed it.
+        if any(
+            entry["hit"].get("kind") == "message_excerpt"
+            and entry["hit"].get("store_id") == store_id
+            for entry in self._ordered[self._cursor:self._prefetched_to]
+        ):
             return
         self.rows.pop(store_id, None)
 

@@ -39,9 +39,10 @@ _ensure_local_package_importable()
 from hermes_lcm.config import LCMConfig  # noqa: E402
 from hermes_lcm.dag import build_nodes_fts_spec  # noqa: E402
 from hermes_lcm.db_bootstrap import ensure_external_content_fts  # noqa: E402
+from hermes_lcm.event_time import ensure_event_time_schema, publish_event_time  # noqa: E402
 from hermes_lcm.ingest_protection import protect_message_for_ingest  # noqa: E402
 from hermes_lcm.message_content import normalize_content_value  # noqa: E402
-from hermes_lcm.store import MessageStore, _normalize_source_value  # noqa: E402
+from hermes_lcm.store import MessageStore, _normalize_observed_at, _normalize_source_value  # noqa: E402
 from hermes_lcm.tokens import count_message_tokens  # noqa: E402
 
 
@@ -71,6 +72,8 @@ class ImportCandidate:
     timestamp: float
     token_estimate: int
     existing_source_key_aliases: tuple[str, ...] = ()
+    observed_at: float | None = None
+    observed_at_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -521,6 +524,8 @@ def _collect_candidates(
                 tool_name=tool_name,
                 timestamp=timestamp,
                 token_estimate=token_estimate,
+                observed_at=_normalize_observed_at(_parse_timestamp(row["message_created_at"], 0.0)),
+                observed_at_source="lossless_claw_message_created_at_utc",
             )
         )
     return candidates, len(rows), skipped_empty, len(conversation_ids)
@@ -739,6 +744,7 @@ def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
     )
     ensure_external_content_fts(conn, build_nodes_fts_spec())
+    ensure_event_time_schema(conn)
 
 
 def _ensure_summary_import_table(conn: sqlite3.Connection) -> None:
@@ -843,6 +849,7 @@ def _insert_summary_node(
         ),
     )
     node_id = int(cur.lastrowid)
+    publish_event_time(conn, node_id, source_ids, source_type)
     conn.execute(
         """INSERT INTO lcm_imported_summaries
            (import_id, source_summary_id, source_conversation_id, source_session,
@@ -1016,6 +1023,7 @@ def _candidate_message(candidate: ImportCandidate) -> dict[str, Any]:
     msg: dict[str, Any] = {
         "role": candidate.role,
         "content": candidate.content,
+        "timestamp": candidate.observed_at,
     }
     if candidate.tool_call_id:
         msg["tool_call_id"] = candidate.tool_call_id
@@ -1041,11 +1049,13 @@ def _insert_import_candidate(
         session_id=candidate.target_session_id,
     )
     tool_calls_json = json.dumps(protected_msg.get("tool_calls")) if protected_msg.get("tool_calls") else None
+    imported_at = time.time()
+    observed_at = _normalize_observed_at(candidate.observed_at)
     cur = conn.execute(
         """INSERT INTO messages
            (session_id, source, role, content, tool_call_id, tool_calls,
-            tool_name, timestamp, token_estimate, pinned)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            tool_name, timestamp, token_estimate, pinned, ingested_at, observed_at, observed_at_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
         (
             candidate.target_session_id,
             _normalize_source_value(candidate.source),
@@ -1056,6 +1066,9 @@ def _insert_import_candidate(
             protected_msg.get("tool_name"),
             candidate.timestamp,
             count_message_tokens(protected_msg),
+            imported_at,
+            observed_at,
+            candidate.observed_at_source if observed_at is not None else None,
         ),
     )
     store_id = int(cur.lastrowid)
@@ -1071,7 +1084,7 @@ def _insert_import_candidate(
             candidate.source_conversation_id,
             candidate.source_session,
             store_id,
-            time.time(),
+            imported_at,
         ),
     )
     return store_id
@@ -2689,6 +2702,8 @@ def _collect_jsonl_candidates(
                     tool_name=str(tool_name) if tool_name is not None else None,
                     timestamp=_parse_timestamp(timestamp_value, now),
                     token_estimate=count_message_tokens(msg_for_tokens),
+                    observed_at=_normalize_observed_at(timestamp_value),
+                    observed_at_source="openclaw_jsonl_message_timestamp",
                     existing_source_key_aliases=existing_source_key_aliases,
                 )
             )
